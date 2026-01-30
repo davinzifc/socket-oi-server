@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 function getNestLoggerLevels(): Array<'log' | 'error' | 'warn' | 'debug' | 'verbose'> {
@@ -47,6 +48,22 @@ async function bootstrap() {
     origin: process.env.CORS_ORIGIN || '*',
     credentials: true,
   });
+
+  const swaggerEnabled =
+    (process.env.SWAGGER_ENABLED || 'true').toLowerCase() === 'true';
+
+  if (swaggerEnabled) {
+    const config = new DocumentBuilder()
+      .setTitle('SocketOi API')
+      .setDescription('API para notificaciones, presencia, métricas y administración de cola.')
+      .setVersion('1.0.0')
+      .addBearerAuth()
+      .build();
+
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('docs', app, document);
+    logger.log('Swagger enabled at: /docs');
+  }
 
   const port = Number(process.env.PORT) || 3000;
   await app.listen(port);

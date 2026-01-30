@@ -214,8 +214,12 @@ Se agregó `GET /metrics` con:
 
 Scripts incluidos:
 
-- `npm run stress:http` (autocannon contra `/notifications/send`)
-  - variables: `CONNECTIONS`, `DURATION`, `PIPELINE`, `AUTH`, `URL`
+- `npm run stress:http` (autocannon)
+  - Soporta targets por modo:
+    - `MODE=user` → `/notifications/send`
+    - `MODE=section` → `/notifications/send-section`
+    - `MODE=chat` → `/notifications/send-chat`
+  - Variables: `MODE`, `CONNECTIONS`, `DURATION`, `PIPELINE`, `AUTH`, `URL`, `SECTIONS`, `CHATS`
 - `npm run stress:ws` (muchos clientes Socket.IO)
   - variables: `CLIENTS`, `SECTIONS`, `CHANGE_EVERY_MS`
 
@@ -223,6 +227,30 @@ Recomendación de medición durante stress:
 
 - contenedores: `docker stats`
 - local: Activity Monitor / `ps` + consulta a `GET /metrics`
+
+---
+
+## 11) Dockerización (Compose + Dockerfile)
+
+Se dejó el proyecto dockerizado para levantar **API + Redis**:
+
+- `Dockerfile` (build producción)
+- `docker-compose.yml` (prod): `app` + `redis`, con:
+  - `env_file: .env`
+  - override `REDIS_HOST=redis`
+  - `healthcheck` para Redis y `depends_on` condicionado a healthy
+  - `restart: unless-stopped`
+- `docker-compose.dev.yml` (dev): hot-reload con volumen montado (`npm run start:dev`)
+
+---
+
+## 12) Swagger / OpenAPI
+
+Se integró Swagger para probar la API fácilmente:
+
+- Dependencias: `@nestjs/swagger`, `swagger-ui-express`
+- UI: `GET /docs` (habilitable con `SWAGGER_ENABLED=true`)
+- Se actualizó `.env.example` para incluir `SWAGGER_ENABLED`.
 
 ---
 
