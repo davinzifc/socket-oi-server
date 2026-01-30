@@ -10,6 +10,7 @@ import {
   ValidationPipe,
   Logger,
 } from '@nestjs/common';
+import { ApiBearerAuth, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { NotificationService } from './notification.service';
 import {
   SendNotificationDto,
@@ -21,6 +22,8 @@ import {
 } from './dto/notification.dto';
 import { AuthGuard } from '../../common/guards/auth.guard';
 
+@ApiTags('Notifications')
+@ApiBearerAuth()
 @Controller('notifications')
 @UseGuards(AuthGuard)
 @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
@@ -31,6 +34,8 @@ export class NotificationController {
 
   @Post('send')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar notificación a un usuario' })
+  @ApiResponse({ status: 202, description: 'Notification queued successfully' })
   async sendNotification(@Body() dto: SendNotificationDto): Promise<{
     message: string;
     timestamp: string;
@@ -49,6 +54,8 @@ export class NotificationController {
 
   @Post('send-multiple')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar notificación a múltiples usuarios' })
+  @ApiResponse({ status: 202, description: 'Notifications queued successfully' })
   async sendMultipleNotifications(@Body() dto: SendMultipleNotificationsDto): Promise<{
     message: string;
     userCount: number;
@@ -69,6 +76,8 @@ export class NotificationController {
 
   @Post('bulk')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar lote de notificaciones (bulk)' })
+  @ApiResponse({ status: 202, description: 'Bulk notifications queued successfully' })
   async sendBulkNotifications(@Body() dto: BulkNotificationsDto): Promise<{
     message: string;
     notificationCount: number;
@@ -87,6 +96,8 @@ export class NotificationController {
 
   @Post('broadcast')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar broadcast a todos los conectados' })
+  @ApiResponse({ status: 202, description: 'Broadcast queued successfully' })
   async broadcast(@Body() dto: BroadcastNotificationDto): Promise<{
     message: string;
     timestamp: string;
@@ -105,6 +116,8 @@ export class NotificationController {
 
   @Post('send-section')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar notificación a una sección (room section:{sectionId})' })
+  @ApiResponse({ status: 202, description: 'Section notification queued successfully' })
   async sendToSection(@Body() dto: SendSectionNotificationDto): Promise<{
     message: string;
     sectionId: string;
@@ -123,6 +136,8 @@ export class NotificationController {
 
   @Post('send-chat')
   @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({ summary: 'Encolar notificación a un chat (room chat:{chatId})' })
+  @ApiResponse({ status: 202, description: 'Chat notification queued successfully' })
   async sendToChat(@Body() dto: SendChatNotificationDto): Promise<{
     message: string;
     chatId: string;
@@ -141,6 +156,8 @@ export class NotificationController {
 
   @Get('stats')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Obtener estadísticas de la cola Bull' })
+  @ApiResponse({ status: 200, description: 'Queue stats' })
   async getStats(): Promise<{ queue: any; timestamp: string }> {
     this.logger.log('Fetching queue statistics');
     const stats = await this.notificationService.getQueueStats();
@@ -149,6 +166,8 @@ export class NotificationController {
 
   @Post('clean')
   @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Limpiar jobs antiguos (completed/failed)' })
+  @ApiResponse({ status: 200, description: 'Queue cleaned successfully' })
   async cleanQueue(): Promise<{ message: string; timestamp: string }> {
     this.logger.log('Cleaning old jobs from queue');
     await this.notificationService.cleanQueue();
