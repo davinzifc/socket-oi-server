@@ -105,6 +105,12 @@ npm run test:e2e
 docker compose up --build
 ```
 
+### Docker (modo desarrollo con hot-reload)
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+```
+
 ## Presencia (API)
 
 - `GET /presence/online` (usuarios online)

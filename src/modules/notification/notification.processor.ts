@@ -28,7 +28,7 @@ export class NotificationProcessor {
   async handleNotification(
     job: Job<NotificationJob>,
   ): Promise<{ success: boolean; processed?: number; error?: string }> {
-    const { type, event, data, userIds, userId } = job.data;
+    const { type, event, data, userIds, userId, sectionId, chatId } = job.data;
 
     this.logger.debug(
       `Processing job ${job.id} of type ${type} (attempt ${job.attemptsMade + 1}/${job.opts.attempts})`,
@@ -44,6 +44,12 @@ export class NotificationProcessor {
           break;
         case 'broadcast':
           await this.processBroadcast(event, data);
+          break;
+        case 'section':
+          await this.processSection(sectionId!, event, data);
+          break;
+        case 'chat':
+          await this.processChat(chatId!, event, data);
           break;
         default:
           throw new Error(`Unknown notification type: ${type}`);
@@ -139,6 +145,16 @@ export class NotificationProcessor {
   private async processBroadcast(event: string, data: any): Promise<void> {
     this.gateway.broadcast(event, data);
     this.logger.debug(`Broadcast ${event} sent to all users`);
+  }
+
+  private async processSection(sectionId: string, event: string, data: any): Promise<void> {
+    this.gateway.sendToSection(sectionId, event, data);
+    this.logger.debug(`Sent ${event} to section ${sectionId}`);
+  }
+
+  private async processChat(chatId: string, event: string, data: any): Promise<void> {
+    this.gateway.sendToChat(chatId, event, data);
+    this.logger.debug(`Sent ${event} to chat ${chatId}`);
   }
 
   @OnQueueActive()

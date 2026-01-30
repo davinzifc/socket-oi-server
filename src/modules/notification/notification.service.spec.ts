@@ -71,5 +71,37 @@ describe('NotificationService', () => {
       paused: false,
     });
   });
+
+  it('should queue notification for a section', async () => {
+    const { service, mockQueue } = makeService();
+
+    await service.sendToSection('home', 'section_ping', { ok: true }, { priority: 4 });
+
+    expect(mockQueue.add).toHaveBeenCalledWith(
+      'send-notification',
+      expect.objectContaining({
+        type: 'section',
+        sectionId: 'home',
+        event: 'section_ping',
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('should queue notification for a chat', async () => {
+    const { service, mockQueue } = makeService();
+
+    await service.sendToChat('room-1', 'chat_message', { text: 'hi' }, { priority: 4 });
+
+    expect(mockQueue.add).toHaveBeenCalledWith(
+      'send-notification',
+      expect.objectContaining({
+        type: 'chat',
+        chatId: 'room-1',
+        event: 'chat_message',
+      }),
+      expect.any(Object),
+    );
+  });
 });
 

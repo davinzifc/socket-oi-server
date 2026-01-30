@@ -16,6 +16,8 @@ import {
   SendMultipleNotificationsDto,
   BulkNotificationsDto,
   BroadcastNotificationDto,
+  SendSectionNotificationDto,
+  SendChatNotificationDto,
 } from './dto/notification.dto';
 import { AuthGuard } from '../../common/guards/auth.guard';
 
@@ -97,6 +99,42 @@ export class NotificationController {
 
     return {
       message: 'Broadcast queued successfully',
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  @Post('send-section')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async sendToSection(@Body() dto: SendSectionNotificationDto): Promise<{
+    message: string;
+    sectionId: string;
+    timestamp: string;
+  }> {
+    this.logger.log(`Received request to send notification to section ${dto.sectionId}`);
+    await this.notificationService.sendToSection(dto.sectionId, dto.event, dto.data, {
+      priority: dto.priority,
+    });
+    return {
+      message: 'Section notification queued successfully',
+      sectionId: dto.sectionId,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  @Post('send-chat')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async sendToChat(@Body() dto: SendChatNotificationDto): Promise<{
+    message: string;
+    chatId: string;
+    timestamp: string;
+  }> {
+    this.logger.log(`Received request to send notification to chat ${dto.chatId}`);
+    await this.notificationService.sendToChat(dto.chatId, dto.event, dto.data, {
+      priority: dto.priority,
+    });
+    return {
+      message: 'Chat notification queued successfully',
+      chatId: dto.chatId,
       timestamp: new Date().toISOString(),
     };
   }

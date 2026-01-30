@@ -98,3 +98,43 @@ export class BroadcastNotificationDto {
   priority?: number;
 }
 
+export class SendSectionNotificationDto {
+  @IsString()
+  @IsNotEmpty()
+  sectionId!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  event!: string;
+
+  @IsObject()
+  @IsNotEmpty()
+  data!: Record<string, any>;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(10)
+  priority?: number;
+}
+
+export class SendChatNotificationDto {
+  @IsString()
+  @IsNotEmpty()
+  chatId!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  event!: string;
+
+  @IsObject()
+  @IsNotEmpty()
+  data!: Record<string, any>;
+
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(10)
+  priority?: number;
+}
+

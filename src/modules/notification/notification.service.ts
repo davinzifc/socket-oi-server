@@ -4,11 +4,13 @@ import type { Queue, JobOptions } from 'bull';
 import { ConfigService } from '@nestjs/config';
 
 export interface NotificationJob {
-  type: 'single' | 'multiple' | 'broadcast';
+  type: 'single' | 'multiple' | 'broadcast' | 'section' | 'chat';
   event: string;
   data: any;
   userIds?: string[];
   userId?: string;
+  sectionId?: string;
+  chatId?: string;
   priority?: number;
   metadata?: Record<string, any>;
 }
@@ -177,6 +179,52 @@ export class NotificationService {
     });
 
     this.logger.log(`Queued broadcast notification: ${event}`);
+  }
+
+  async sendToSection(
+    sectionId: string,
+    event: string,
+    data: any,
+    options?: Partial<JobOptions>,
+  ): Promise<void> {
+    const job: NotificationJob = {
+      type: 'section',
+      sectionId,
+      event,
+      data,
+      metadata: { queuedAt: new Date().toISOString() },
+    };
+
+    await this.notificationQueue.add('send-notification', job, {
+      priority: options?.priority ?? 4,
+      removeOnComplete: true,
+      removeOnFail: false,
+      ...options,
+    });
+    this.logger.debug(`Queued notification for section ${sectionId}`);
+  }
+
+  async sendToChat(
+    chatId: string,
+    event: string,
+    data: any,
+    options?: Partial<JobOptions>,
+  ): Promise<void> {
+    const job: NotificationJob = {
+      type: 'chat',
+      chatId,
+      event,
+      data,
+      metadata: { queuedAt: new Date().toISOString() },
+    };
+
+    await this.notificationQueue.add('send-notification', job, {
+      priority: options?.priority ?? 4,
+      removeOnComplete: true,
+      removeOnFail: false,
+      ...options,
+    });
+    this.logger.debug(`Queued notification for chat ${chatId}`);
   }
 
   async getQueueStats(): Promise<QueueStats> {

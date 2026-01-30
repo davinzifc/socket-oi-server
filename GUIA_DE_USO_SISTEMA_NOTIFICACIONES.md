@@ -487,8 +487,23 @@ this.notificationGateway.sendToSection("home", "section_ping", {
 });
 ```
 
-**Opción 2:** si quieres que quede “asíncrono” y se procese por Bull, lo ideal es crear un endpoint/job tipo `section` (no viene por defecto).
-Si lo necesitas, te lo puedo agregar.
+**Opción 2 (HTTP + Bull, ya soportado):** encolar una notificación a una sección específica.
+
+Endpoint:
+
+- `POST /notifications/send-section`
+
+```bash
+curl -X POST "http://localhost:3000/notifications/send-section" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev" \
+  -d '{
+    "sectionId":"home",
+    "event":"section_ping",
+    "data":{"message":"Hola HOME"},
+    "priority":4
+  }'
+```
 
 ### Caso 5 — Chat: enviar a todos los miembros de un chat (room `chat:{chatId}`)
 
@@ -505,7 +520,25 @@ this.notificationGateway.sendToChat("room-1", "chat_message", {
 ```
 
 Si quieres hacerlo desde un backend externo por HTTP, lo habitual es exponer un endpoint
-`POST /chats/:chatId/message` que internamente llame `sendToChat(...)` (no viene por defecto).
+`POST /chats/:chatId/message` que internamente llame `sendToChat(...)`.
+
+**HTTP + Bull (ya soportado en este proyecto):**
+
+Endpoint:
+
+- `POST /notifications/send-chat`
+
+```bash
+curl -X POST "http://localhost:3000/notifications/send-chat" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dev" \
+  -d '{
+    "chatId":"room-1",
+    "event":"chat_message",
+    "data":{"from":"user123","text":"hola chat","ts":"2026-01-30T00:00:00.000Z"},
+    "priority":4
+  }'
+```
 
 ### Caso 6 — “Backend central” → SocketOi (patrón recomendado)
 
