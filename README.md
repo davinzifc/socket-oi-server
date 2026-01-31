@@ -70,6 +70,22 @@ curl -X POST "http://localhost:3000/notifications/send" \
   - Evento `chat:join` `{ chatId }` → room `chat:{chatId}`
 - Salir de un chat:
   - Evento `chat:leave` `{ chatId }`
+- Enviar mensaje a un chat (Política A: no-echo al emisor):
+  - Evento `chat:sendMessage` `{ chatId, text|data, clientMessageId? }`
+  - El server emite `chat_message` a todos en `chat:{chatId}` **menos** al socket emisor.
+
+### DM (1:1)
+
+- Enviar mensaje directo (Política A: no-echo):
+  - Evento `dm:send` `{ toUserId, data, event? }`
+  - El server emite al room `user:{toUserId}` (solo destinatario).
+
+### Emitir a sección / broadcast desde cliente (Política A)
+
+- A sección actual (sin echo):
+  - Evento `section:emit` `{ event, data, sectionId? }` → se emite a `section:{sectionId}`
+- Broadcast global (sin echo):
+  - Evento `broadcast:emit` `{ event, data }` → se emite a todos los conectados menos al emisor
 
 Ejemplo (pseudo):
 
@@ -89,6 +105,14 @@ socket.emit("presence:setSection", { sectionId: "chat" }, (ack) =>
 
 // unirse a un chat
 socket.emit("chat:join", { chatId: "room-1" });
+
+// enviar mensaje al chat (no te vuelve a llegar a ti)
+socket.emit("chat:sendMessage", { chatId: "room-1", text: "hola" }, (ack) =>
+  console.log(ack),
+);
+
+// dm a otro usuario (solo lo recibe el destinatario)
+socket.emit("dm:send", { toUserId: "user456", data: { text: "hola" } });
 ```
 
 ## Tests
@@ -114,12 +138,31 @@ docker compose -f docker-compose.dev.yml up --build
 ## Presencia (API)
 
 - `GET /presence/online` (usuarios online)
+- `GET /presence/sections` (secciones activas)
 - `GET /presence/section/:sectionId` (usuarios presentes en una sección)
+- `GET /presence/chats` (chats activos)
+- `GET /presence/chat/:chatId` (usuarios presentes en un chat)
 - `GET /presence/user/:userId` (sockets/secciones del usuario)
+
+## Presencia (config recomendada)
+
+Para que “online/offline” se actualice rápido ante cierres abruptos:
+
+- `SOCKET_PING_TIMEOUT` / `SOCKET_PING_INTERVAL`: define cuánto tarda Socket.IO en detectar que el cliente ya no responde.
+- `PRESENCE_SOCKET_TTL_SECONDS`: TTL de presencia en Redis (recomendado **ligeramente mayor** al ping timeout).
+- `PRESENCE_SWEEP_INTERVAL_MS`: intervalo del sweeper que emite `presence:user_offline` cuando expira el TTL.
+
+Valores típicos en dev:
+
+- `SOCKET_PING_TIMEOUT=20000`
+- `SOCKET_PING_INTERVAL=5000`
+- `PRESENCE_SOCKET_TTL_SECONDS=45`
+- `PRESENCE_SWEEP_INTERVAL_MS=5000`
 
 ## Métricas (Prometheus)
 
 - `GET /metrics`
+  - incluye `presence_active_sections` y `presence_active_chats`
 
 ## Stress tests
 

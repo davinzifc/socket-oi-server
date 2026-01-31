@@ -17,6 +17,26 @@ export class MetricsService {
     },
   });
 
+  private readonly activeSectionsGauge = new Gauge({
+    name: 'presence_active_sections',
+    help: 'Cantidad de secciones activas (con al menos 1 usuario)',
+    registers: [this.registry],
+    collect: async () => {
+      const sections = await this.presenceService.getActiveSections(100000);
+      this.activeSectionsGauge.set(sections.length);
+    },
+  });
+
+  private readonly activeChatsGauge = new Gauge({
+    name: 'presence_active_chats',
+    help: 'Cantidad de chats activos (con al menos 1 usuario)',
+    registers: [this.registry],
+    collect: async () => {
+      const chats = await this.presenceService.getActiveChats(100000);
+      this.activeChatsGauge.set(chats.length);
+    },
+  });
+
   private readonly bullWaitingGauge = new Gauge({
     name: 'bull_notifications_waiting',
     help: 'Jobs waiting en cola notifications',

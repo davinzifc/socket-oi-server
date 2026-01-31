@@ -19,6 +19,15 @@ export class PresenceController {
     return { count, users };
   }
 
+  @Get('sections')
+  @ApiOperation({ summary: 'Listar secciones activas (con al menos 1 usuario)' })
+  @ApiQuery({ name: 'limit', required: false, example: 200 })
+  async activeSections(@Query('limit') limit?: string) {
+    const n = limit ? parseInt(limit, 10) : 200;
+    const sections = await this.presenceService.getActiveSections(n);
+    return { count: sections.length, sections };
+  }
+
   @Get('section/:sectionId')
   @ApiOperation({ summary: 'Listar usuarios presentes en una sección' })
   @ApiParam({ name: 'sectionId', example: 'home' })
@@ -30,6 +39,25 @@ export class PresenceController {
     const n = limit ? parseInt(limit, 10) : 500;
     const users = await this.presenceService.getSectionUsers(sectionId, n);
     return { sectionId, count: users.length, users };
+  }
+
+  @Get('chats')
+  @ApiOperation({ summary: 'Listar chats activos (con al menos 1 usuario)' })
+  @ApiQuery({ name: 'limit', required: false, example: 200 })
+  async activeChats(@Query('limit') limit?: string) {
+    const n = limit ? parseInt(limit, 10) : 200;
+    const chats = await this.presenceService.getActiveChats(n);
+    return { count: chats.length, chats };
+  }
+
+  @Get('chat/:chatId')
+  @ApiOperation({ summary: 'Listar usuarios presentes en un chat' })
+  @ApiParam({ name: 'chatId', example: 'room-1' })
+  @ApiQuery({ name: 'limit', required: false, example: 500 })
+  async chatUsers(@Param('chatId') chatId: string, @Query('limit') limit?: string) {
+    const n = limit ? parseInt(limit, 10) : 500;
+    const users = await this.presenceService.getChatUsers(chatId, n);
+    return { chatId, count: users.length, users };
   }
 
   @Get('user/:userId')

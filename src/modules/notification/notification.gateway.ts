@@ -9,7 +9,7 @@ import {
   MessageBody,
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
-import { Logger, UseFilters } from '@nestjs/common';
+import { Logger, UseFilters, OnModuleDestroy } from '@nestjs/common';
 import { WsExceptionFilter } from '../../common/filters/ws-exception.filter';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
@@ -19,6 +19,7 @@ const PING_TIMEOUT = parseInt(process.env.SOCKET_PING_TIMEOUT || '60000', 10);
 const PING_INTERVAL = parseInt(process.env.SOCKET_PING_INTERVAL || '25000', 10);
 const REDIS_ADAPTER_ENABLED =
   (process.env.SOCKET_REDIS_ADAPTER_ENABLED || '').toLowerCase() === 'true';
+const PRESENCE_SWEEP_INTERVAL_MS = parseInt(process.env.PRESENCE_SWEEP_INTERVAL_MS || '10000', 10);
 
 @WebSocketGateway({
   cors: {
@@ -33,7 +34,7 @@ const REDIS_ADAPTER_ENABLED =
 })
 @UseFilters(WsExceptionFilter)
 export class NotificationGateway
-  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy {
   @WebSocketServer()
   server!: Server;
 
@@ -42,10 +43,67 @@ export class NotificationGateway
   private readonly userSockets = new Map<string, Set<string>>();
   private readonly socketUsers = new Map<string, string>();
   private readonly socketSection = new Map<string, string>(); // socketId -> sectionId (cache local)
+  private presenceSweepTimer?: NodeJS.Timeout;
 
   constructor(private readonly presenceService: PresenceService) { }
 
+  private nowIso() {
+    return new Date().toISOString();
+  }
+
+  private getUserIdOrThrow(client: Socket): string {
+    const userId = this.socketUsers.get(client.id);
+    if (!userId) throw new Error('unauthorized_socket');
+    return userId;
+  }
+
+  private makeMessageId(): string {
+    // Evitamos dependencia extra; suficiente para deduplicación en cliente (si se usa).
+    return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  private async isSocketInRoom(client: Socket, room: string): Promise<boolean> {
+    // Socket.IO v4: rooms es Set<string>
+    return client.rooms?.has(room) ?? false;
+  }
+
+  private presenceWatchRoom() {
+    return 'presence:watch';
+  }
+
+  private startPresenceSweeper() {
+    if (this.presenceSweepTimer) return;
+    if (PRESENCE_SWEEP_INTERVAL_MS <= 0) return;
+
+    this.presenceSweepTimer = setInterval(async () => {
+      try {
+        const offlineUsers = await this.presenceService.cleanupStaleOnlineUsers();
+        if (!offlineUsers.length) return;
+
+        const ts = this.nowIso();
+        for (const userId of offlineUsers) {
+          // Evento global para UIs (no requiere subscribe)
+          this.server.emit('presence:user_offline', { userId, ts, reason: 'ttl' });
+          // Evento de monitoring (watchers)
+          this.server.to(this.presenceWatchRoom()).emit('presence:user_disconnected', {
+            userId,
+            ts,
+            reason: 'ttl',
+          });
+        }
+      } catch (e: any) {
+        this.logger.warn(`Presence sweeper failed: ${e?.message || e}`);
+      }
+    }, PRESENCE_SWEEP_INTERVAL_MS);
+
+    // No bloquear cierre de proceso / tests
+    (this.presenceSweepTimer as any)?.unref?.();
+  }
+
   async afterInit(server: Server): Promise<void> {
+    // Sweeper de presencia (independiente del adapter)
+    this.startPresenceSweeper();
+
     if (!REDIS_ADAPTER_ENABLED) {
       this.logger.log('Socket.IO Redis adapter disabled (SOCKET_REDIS_ADAPTER_ENABLED!=true)');
       return;
@@ -86,6 +144,7 @@ export class NotificationGateway
         return;
       }
 
+      const wasOnline = this.isUserConnected(userId);
       this.registerUserSocket(userId, client.id);
       await client.join(`user:${userId}`);
 
@@ -99,6 +158,24 @@ export class NotificationGateway
         userId,
         socketId: client.id,
         sectionId: sectionId || undefined,
+      });
+
+      // Evento global para UIs (solo cuando pasa a online)
+      if (!wasOnline) {
+        this.server.emit('presence:user_online', {
+          userId,
+          socketId: client.id,
+          sectionId: sectionId || undefined,
+          ts: this.nowIso(),
+        });
+      }
+
+      // Notificar a clientes "watchers" (monitoring)
+      this.server.to(this.presenceWatchRoom()).emit('presence:user_connected', {
+        userId,
+        socketId: client.id,
+        sectionId: sectionId || undefined,
+        ts: this.nowIso(),
       });
 
       client.emit('connected', {
@@ -124,12 +201,36 @@ export class NotificationGateway
       this.socketSection.delete(client.id);
       this.unregisterUserSocket(userId, client.id);
       await this.presenceService.onDisconnect(client.id);
+
       const remainingSockets = this.userSockets.get(userId)?.size || 0;
+
+      // Evento global para UIs (solo cuando el usuario ya no tiene sockets)
+      if (remainingSockets <= 0) {
+        this.server.emit('presence:user_offline', {
+          userId,
+          socketId: client.id,
+          ts: this.nowIso(),
+          reason: 'disconnect',
+        });
+      }
+
+      this.server.to(this.presenceWatchRoom()).emit('presence:user_disconnected', {
+        userId,
+        socketId: client.id,
+        ts: this.nowIso(),
+      });
       this.logger.log(
         `User ${userId} disconnected socket ${client.id} (Remaining sockets: ${remainingSockets})`,
       );
     } catch (error: any) {
       this.logger.error(`Error handling disconnect: ${error.message}`, error.stack);
+    }
+  }
+
+  onModuleDestroy() {
+    if (this.presenceSweepTimer) {
+      clearInterval(this.presenceSweepTimer);
+      this.presenceSweepTimer = undefined;
     }
   }
 
@@ -221,9 +322,31 @@ export class NotificationGateway
         socketId: client.id,
         sectionId,
       });
+      // renovar TTL/lastSeen
+      await this.presenceService.heartbeat({ socketId: client.id, sectionId });
       return { ok: true, previousSectionId: previousSectionId || prev, sectionId };
     } catch (e: any) {
       return { ok: false, error: e?.message || 'set_section_failed' };
+    }
+  }
+
+  /**
+   * Heartbeat recomendado desde frontend (ej. cada 15-30s).
+   * Mantiene presencia correcta en caso de cierres abruptos / caídas de internet.
+   */
+  @SubscribeMessage('presence:heartbeat')
+  async presenceHeartbeat(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { sectionId?: string },
+  ) {
+    const sectionId =
+      (body?.sectionId?.trim?.() ? body.sectionId.trim() : '') ||
+      (this.socketSection.get(client.id) || undefined);
+    try {
+      await this.presenceService.heartbeat({ socketId: client.id, sectionId });
+      return { ok: true, ts: this.nowIso() };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'heartbeat_failed' };
     }
   }
 
@@ -235,6 +358,18 @@ export class NotificationGateway
     const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
     if (!chatId) return { ok: false, error: 'missing_chatId' };
     await client.join(this.chatRoom(chatId));
+    try {
+      await this.presenceService.chatJoin({ socketId: client.id, chatId });
+    } catch { }
+    const fromUserId = this.socketUsers.get(client.id);
+    if (fromUserId) {
+      this.server.to(this.presenceWatchRoom()).emit('presence:chat_joined', {
+        userId: fromUserId,
+        socketId: client.id,
+        chatId,
+        ts: this.nowIso(),
+      });
+    }
     return { ok: true, chatId };
   }
 
@@ -246,7 +381,161 @@ export class NotificationGateway
     const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
     if (!chatId) return { ok: false, error: 'missing_chatId' };
     await client.leave(this.chatRoom(chatId));
+    try {
+      await this.presenceService.chatLeave({ socketId: client.id, chatId });
+    } catch { }
+    const fromUserId = this.socketUsers.get(client.id);
+    if (fromUserId) {
+      this.server.to(this.presenceWatchRoom()).emit('presence:chat_left', {
+        userId: fromUserId,
+        socketId: client.id,
+        chatId,
+        ts: this.nowIso(),
+      });
+    }
     return { ok: true, chatId };
+  }
+
+  /**
+   * Suscribirse a eventos de presencia del sistema.
+   * Un "cliente admin/monitor" puede recibir:
+   * - presence:user_connected
+   * - presence:user_disconnected
+   * - presence:chat_joined
+   * - presence:chat_left
+   */
+  @SubscribeMessage('presence:subscribe')
+  async presenceSubscribe(@ConnectedSocket() client: Socket) {
+    await client.join(this.presenceWatchRoom());
+    return { ok: true };
+  }
+
+  @SubscribeMessage('presence:unsubscribe')
+  async presenceUnsubscribe(@ConnectedSocket() client: Socket) {
+    await client.leave(this.presenceWatchRoom());
+    return { ok: true };
+  }
+
+  /**
+   * Política A (recomendada): el emisor NO recibe echo.
+   * - Envia a todos en la room del chat excepto al socket emisor.
+   */
+  @SubscribeMessage('chat:sendMessage')
+  async chatSendMessage(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { chatId: string; text?: string; data?: any; clientMessageId?: string },
+  ) {
+    const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
+    if (!chatId) return { ok: false, error: 'missing_chatId' };
+
+    const room = this.chatRoom(chatId);
+    const inRoom = await this.isSocketInRoom(client, room);
+    if (!inRoom) return { ok: false, error: 'not_in_chat_room' };
+
+    const fromUserId = this.getUserIdOrThrow(client);
+    const messageId = this.makeMessageId();
+    const payload = {
+      messageId,
+      clientMessageId: body?.clientMessageId,
+      fromUserId,
+      chatId,
+      ts: this.nowIso(),
+      data: body?.data ?? { text: body?.text ?? '' },
+    };
+
+    // no-echo: excluir emisor
+    client.to(room).emit('chat_message', payload);
+    return { ok: true, messageId, ts: payload.ts };
+  }
+
+  /**
+   * Emitir a la sección actual del emisor (o a una sección específica),
+   * excluyendo al socket emisor (Política A).
+   */
+  @SubscribeMessage('section:emit')
+  async sectionEmit(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { sectionId?: string; event: string; data: any },
+  ) {
+    const event = body?.event?.trim?.() ? body.event.trim() : '';
+    if (!event) return { ok: false, error: 'missing_event' };
+
+    const sectionId =
+      (body?.sectionId?.trim?.() ? body.sectionId.trim() : '') ||
+      (this.socketSection.get(client.id) || '');
+
+    if (!sectionId) return { ok: false, error: 'missing_sectionId' };
+
+    const room = this.sectionRoom(sectionId);
+    const inRoom = await this.isSocketInRoom(client, room);
+    if (!inRoom) return { ok: false, error: 'not_in_section_room' };
+
+    const fromUserId = this.getUserIdOrThrow(client);
+    const payload = {
+      messageId: this.makeMessageId(),
+      fromUserId,
+      sectionId,
+      ts: this.nowIso(),
+      data: body.data,
+    };
+
+    client.to(room).emit(event, payload);
+    return { ok: true, sectionId, ts: payload.ts };
+  }
+
+  /**
+   * Broadcast global iniciado por un cliente, excluyendo al emisor (Política A).
+   * Útil para "avisos" desde UI admin, etc.
+   */
+  @SubscribeMessage('broadcast:emit')
+  async broadcastEmit(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { event: string; data: any },
+  ) {
+    const event = body?.event?.trim?.() ? body.event.trim() : '';
+    if (!event) return { ok: false, error: 'missing_event' };
+
+    const fromUserId = this.getUserIdOrThrow(client);
+    const payload = {
+      messageId: this.makeMessageId(),
+      fromUserId,
+      ts: this.nowIso(),
+      data: body.data,
+    };
+
+    // no-echo global
+    client.broadcast.emit(event, payload);
+    return { ok: true, ts: payload.ts };
+  }
+
+  /**
+   * DM (1:1) iniciado por un cliente:
+   * - entrega al destinatario (room user:{toUserId})
+   * - NO hace echo al emisor (Política A)
+   */
+  @SubscribeMessage('dm:send')
+  async dmSend(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() body: { toUserId: string; event?: string; data: any; clientMessageId?: string },
+  ) {
+    const toUserId = body?.toUserId?.trim?.() ? body.toUserId.trim() : '';
+    if (!toUserId) return { ok: false, error: 'missing_toUserId' };
+
+    const fromUserId = this.getUserIdOrThrow(client);
+    const event = body?.event?.trim?.() ? body.event.trim() : 'dm_message';
+
+    const payload = {
+      messageId: this.makeMessageId(),
+      clientMessageId: body?.clientMessageId,
+      fromUserId,
+      toUserId,
+      ts: this.nowIso(),
+      data: body.data,
+    };
+
+    // Enviar solo al destinatario, excluyendo al socket emisor por diseño
+    client.to(`user:${toUserId}`).emit(event, payload);
+    return { ok: true, ts: payload.ts };
   }
 
   private registerUserSocket(userId: string, socketId: string): void {

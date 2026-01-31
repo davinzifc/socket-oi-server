@@ -56,41 +56,63 @@ cp .env.example .env
 
 2. Variables más importantes:
 
-- **Redis**: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`
+- **Redis (local o AWS ElastiCache)**:
+  - recomendado: `REDIS_URL` (ej. `rediss://<endpoint>:6379`)
+  - si hay token: `REDIS_PASSWORD`
+  - TLS: `REDIS_TLS`, `REDIS_TLS_REJECT_UNAUTHORIZED`
+  - fail-fast: `REDIS_REQUIRED=true`, `REDIS_CONNECT_TIMEOUT_MS`
+- **Compatibilidad**: también puedes usar `REDIS_HOST/REDIS_PORT/REDIS_DB` si no usas `REDIS_URL`
 - **Bull limiter** (muy importante en carga): `BULL_LIMITER_MAX`, `BULL_LIMITER_DURATION`
 - **Concurrencia del processor**: `PROCESSOR_CONCURRENCY_SINGLE`, `PROCESSOR_CONCURRENCY_BATCH`
 - **Logs**: `LOG_LEVEL` (`debug` genera muchísimos logs por job)
 - **Auth**: `AUTH_REQUIRED=false` (en dev) / `true` (exige header Authorization)
-- **Presencia**: `PRESENCE_SOCKET_TTL_SECONDS`
+- **Presencia**:
+  - `PRESENCE_SOCKET_TTL_SECONDS` (cuánto tarda en “caer” un usuario sin heartbeat/disconnect)
+  - `PRESENCE_SWEEP_INTERVAL_MS` (cada cuánto se detecta y emite `presence:user_offline` por TTL)
+- **Swagger**: `SWAGGER_ENABLED=true` (UI en `/docs`)
 
 ---
 
-## 3) Cómo ejecutar Redis
+## 3) Redis: opciones de ejecución (local vs ElastiCache)
 
-### 3.1 Con Docker Compose (recomendado)
+### 3.1 Opción A (recomendada en AWS): usar ElastiCache / Redis externo
 
-Desde la raíz del repo (donde está `docker-compose.yml`):
+En este modo **NO** levantas Redis con Docker. Solo configuras `.env` apuntando a tu Redis externo:
+
+```env
+REDIS_URL=rediss://<endpoint-elasticache>:6379
+REDIS_PASSWORD=<TOKEN_SI_APLICA>
+REDIS_TLS=true
+REDIS_TLS_REJECT_UNAUTHORIZED=true
+REDIS_REQUIRED=true
+```
+
+> Nota: ElastiCache suele estar en VPC privada. Tu app debe correr con conectividad a esa VPC.
+
+### 3.2 Opción B (desarrollo local): Redis con Docker Compose (overlay)
+
+Desde la raíz del repo:
 
 ```bash
-docker compose up -d redis
+docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d
 ```
 
 Detener:
 
 ```bash
-docker compose stop redis
+docker compose -f docker-compose.yml -f docker-compose.redis.yml stop redis
 ```
 
 Bajar y borrar contenedor:
 
 ```bash
-docker compose down
+docker compose -f docker-compose.yml -f docker-compose.redis.yml down
 ```
 
 Bajar y **borrar datos** (volumen):
 
 ```bash
-docker compose down -v
+docker compose -f docker-compose.yml -f docker-compose.redis.yml down -v
 ```
 
 ### 3.2 Problemas comunes con Docker
@@ -116,6 +138,158 @@ Servidor: `http://localhost:3000`
 ```bash
 docker compose up --build
 ```
+
+### 4.3 Swagger (UI de pruebas)
+
+Si `SWAGGER_ENABLED=true`:
+
+- Swagger UI: `http://localhost:3000/docs`
+
+---
+
+## 4.4 Quickstart FRONTEND (paso a paso, único documento)
+
+Esta sección es la “receta” para que un frontend (o un LLM) pueda integrar el servidor sin leer nada más.
+
+### Paso 0 — Instalar dependencia
+
+```bash
+npm install socket.io-client
+```
+
+### Paso 1 — Conectar al Socket.IO (obligatorio: `userId`)
+
+Regla:
+
+- Si no envías `userId`, el servidor **rechaza** la conexión.
+
+Recomendación profesional:
+
+- `userId` debe ser un **identificador único y estable** (por ejemplo ID de tu base de datos o UUID).
+- No uses “nombre visible” como `userId` (ej. "David") porque si dos personas usan el mismo nombre:
+  - compartirán el mismo room `user:David`
+  - recibirán mensajes del otro por error.
+- El nombre visible muéstralo aparte en tu UI, no como `userId`.
+
+```js
+import { io } from "socket.io-client";
+
+const socket = io("http://localhost:3000", {
+  transports: ["websocket", "polling"],
+  query: {
+    userId: "user123",
+    // opcional: sección inicial
+    sectionId: "home",
+  },
+});
+
+socket.on("connected", (payload) => {
+  console.log("connected", payload); // { socketId, userId, timestamp }
+});
+
+socket.on("error", (err) => {
+  console.log("ws error", err);
+});
+```
+
+### Paso 2 — Suscribirse a eventos que vas a recibir
+
+Eventos comunes (ejemplos):
+
+```js
+socket.on("chat_message", (msg) => console.log("chat_message", msg));
+socket.on("dm_message", (msg) => console.log("dm_message", msg));
+
+// eventos custom del negocio (notificaciones)
+socket.on("new_message", (data) => console.log("new_message", data));
+socket.on("system_announcement", (data) =>
+  console.log("system_announcement", data),
+);
+
+// presencia "push" (para actualizar UI sin refrescar)
+socket.on("presence:user_online", (e) => console.log("user online", e)); // { userId, ts, ... }
+socket.on("presence:user_offline", (e) => console.log("user offline", e)); // { userId, ts, reason }
+```
+
+### Paso 3 — Presencia por secciones (tracking de “en qué página está”)
+
+Cuando el usuario cambia de sección/pantalla en tu SPA, emite:
+
+```js
+socket.emit("presence:setSection", { sectionId: "chat" }, (ack) => {
+  console.log("ack setSection", ack);
+});
+```
+
+### Paso 3.1 — Heartbeat (muy recomendado para evitar “usuarios pegados”)
+
+Si el navegador se cierra a la fuerza o el usuario pierde internet, a veces no llega el `disconnect`.
+Para que la presencia sea precisa, envía un heartbeat cada 15–30s:
+
+```js
+setInterval(() => {
+  socket.emit("presence:heartbeat", { sectionId: "chat" }, (ack) => {
+    // opcional: log/telemetría
+  });
+}, 20000);
+```
+
+### Paso 4 — Unirse a un chat (room) y enviar mensajes (Política A: no-echo)
+
+1. Unirse:
+
+```js
+socket.emit("chat:join", { chatId: "room-1" }, (ack) =>
+  console.log("join ack", ack),
+);
+```
+
+2. Enviar mensaje (no te llega a ti; solo a los demás):
+
+```js
+socket.emit(
+  "chat:sendMessage",
+  { chatId: "room-1", text: "hola", clientMessageId: "c-001" },
+  (ack) => console.log("send ack", ack),
+);
+```
+
+El resto de clientes en `chat:room-1` reciben `chat_message`.
+
+### Paso 5 — DM (1:1) a otro usuario (Política A: no-echo)
+
+```js
+socket.emit("dm:send", {
+  toUserId: "user456",
+  data: { text: "hola" },
+});
+```
+
+El destinatario recibe `dm_message` (por defecto).
+
+### Paso 6 — Emitir a la sección actual sin echo (opcional)
+
+Útil para eventos tipo “typing”, “presence ping”, etc.
+
+```js
+socket.emit(
+  "section:emit",
+  { event: "typing", data: { isTyping: true } },
+  (ack) => console.log("ack", ack),
+);
+```
+
+### Paso 7 — Broadcast global sin echo (opcional)
+
+```js
+socket.emit(
+  "broadcast:emit",
+  { event: "global_notice", data: { msg: "hola" } },
+  (ack) => console.log("ack", ack),
+);
+```
+
+> Recomendación profesional: en producción restringe `broadcast:emit` a roles/admin.
 
 ---
 
@@ -308,6 +482,155 @@ socket.on("chat_message", (msg) => console.log("chat_message", msg));
 
 ---
 
+## 7.5 Política A (recomendada): “no-echo” al socket emisor
+
+Cuando el **origen es un cliente Socket.IO**, este servidor aplica la política:
+
+- Si el cliente emite a un room (`chat:{id}`, `section:{id}`) → el servidor re-emite a **todos menos** al socket emisor.
+- Si el cliente hace broadcast → el servidor re-emite a **todos menos** al socket emisor.
+
+Motivo:
+
+- Evitar duplicados en UI (el emisor suele hacer “optimistic update”).
+- Mantener sincronización multi-tab (otra pestaña del mismo usuario sí recibe, porque no es el socket emisor).
+
+---
+
+## 7.6 Eventos cliente → servidor (acciones en tiempo real)
+
+### 7.6.1 Chat: enviar mensaje a un chat (sin echo)
+
+Pre-requisito: el socket debe estar unido al chat (`chat:join`).
+
+**Cliente emite:**
+
+- Evento: `chat:sendMessage`
+- Body:
+  - `chatId` (string, requerido)
+  - `text` (string, opcional) o `data` (objeto, opcional)
+  - `clientMessageId` (string opcional, para deduplicar en frontend)
+
+Ejemplo:
+
+```js
+socket.emit(
+  "chat:sendMessage",
+  { chatId: "room-1", text: "hola", clientMessageId: "c-001" },
+  (ack) => console.log("ack", ack),
+);
+```
+
+**Servidor emite a los demás (evento recibido por otros):**
+
+- Evento: `chat_message`
+- Payload (envelope):
+  - `messageId` (server id)
+  - `clientMessageId` (si se envió)
+  - `fromUserId`
+  - `chatId`
+  - `ts`
+  - `data`
+
+### 7.6.2 DM (1:1): enviar a otro usuario (sin echo)
+
+**Cliente emite:**
+
+- Evento: `dm:send`
+- Body:
+  - `toUserId` (string requerido)
+  - `data` (objeto requerido)
+  - `event` (string opcional, default `dm_message`)
+
+Ejemplo:
+
+```js
+socket.emit("dm:send", { toUserId: "user456", data: { text: "hola" } });
+```
+
+**Servidor emite al destinatario:**
+
+- Evento: `dm_message` (o el `event` custom)
+- Room destino: `user:{toUserId}`
+
+### 7.6.3 Sección: emitir a la sección actual (sin echo)
+
+**Cliente emite:**
+
+- Evento: `section:emit`
+- Body:
+  - `event` (string requerido)
+  - `data` (objeto requerido)
+  - `sectionId` (opcional; si no se envía, usa la sección actual del socket)
+
+Ejemplo:
+
+```js
+socket.emit("section:emit", { event: "typing", data: { isTyping: true } });
+```
+
+El server re-emite a `section:{sectionId}` excluyendo al emisor.
+
+### 7.6.4 Broadcast: emitir a todos (sin echo)
+
+**Cliente emite:**
+
+- Evento: `broadcast:emit`
+- Body: `{ event, data }`
+
+Ejemplo:
+
+```js
+socket.emit("broadcast:emit", {
+  event: "global_notice",
+  data: { msg: "hola" },
+});
+```
+
+El server re-emite a todos los conectados excluyendo al emisor.
+
+---
+
+## 7.7 Monitoreo en tiempo real (presencia: eventos del sistema)
+
+Además de consultar por REST (`/presence/...`), puedes tener un “panel admin” (o un monitor)
+que reciba eventos cuando:
+
+- un usuario se conecta / desconecta
+- un usuario entra / sale de un chat
+
+### 7.7.1 Suscribirse como watcher
+
+**Cliente emite:**
+
+- Evento: `presence:subscribe`
+
+```js
+socket.emit("presence:subscribe", {}, (ack) =>
+  console.log("subscribe ack", ack),
+);
+```
+
+### 7.7.2 Eventos que recibirá el watcher
+
+- `presence:user_connected`
+  - `{ userId, socketId, sectionId?, ts }`
+- `presence:user_disconnected`
+  - `{ userId, socketId, ts }`
+- `presence:chat_joined`
+  - `{ userId, socketId, chatId, ts }`
+- `presence:chat_left`
+  - `{ userId, socketId, chatId, ts }`
+
+### 7.7.3 Desuscribirse
+
+```js
+socket.emit("presence:unsubscribe", {}, (ack) =>
+  console.log("unsubscribe ack", ack),
+);
+```
+
+---
+
 ## 8) Distribución por salas (cómo “enviar según sala”)
 
 Este repo expone métodos en `NotificationGateway` para emitir por:
@@ -345,7 +668,15 @@ Este repo expone métodos en `NotificationGateway` para emitir por:
 curl -sS "http://localhost:3000/presence/online"
 ```
 
-### 9.2 Usuarios en una sección
+### 9.2 Secciones activas (con al menos 1 usuario)
+
+`GET /presence/sections`
+
+```bash
+curl -sS "http://localhost:3000/presence/sections"
+```
+
+### 9.3 Usuarios en una sección
 
 `GET /presence/section/:sectionId`
 
@@ -353,7 +684,23 @@ curl -sS "http://localhost:3000/presence/online"
 curl -sS "http://localhost:3000/presence/section/home"
 ```
 
-### 9.3 Estado de un usuario (sockets + secciones)
+### 9.4 Chats activos (con al menos 1 usuario)
+
+`GET /presence/chats`
+
+```bash
+curl -sS "http://localhost:3000/presence/chats"
+```
+
+### 9.5 Usuarios en un chat
+
+`GET /presence/chat/:chatId`
+
+```bash
+curl -sS "http://localhost:3000/presence/chat/room-1"
+```
+
+### 9.6 Estado de un usuario (sockets + secciones)
 
 `GET /presence/user/:userId`
 
