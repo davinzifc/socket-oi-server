@@ -102,13 +102,27 @@ npm run test:e2e
 ## Docker (app + redis)
 
 ```bash
+# Solo APP (usa ElastiCache / Redis externo configurado en .env)
 docker compose up --build
+```
+
+### Docker (app + redis local)
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.redis.yml up --build
 ```
 
 ### Docker (modo desarrollo con hot-reload)
 
 ```bash
+# Solo APP (usa ElastiCache / Redis externo)
 docker compose -f docker-compose.dev.yml up --build
+```
+
+### Docker dev + redis local
+
+```bash
+docker compose -f docker-compose.dev.yml -f docker-compose.redis.yml up --build
 ```
 
 ## Presencia (API)

@@ -9,13 +9,34 @@ export class RedisService implements OnModuleDestroy {
 
   constructor(private readonly configService: ConfigService) { }
 
+  private parseRedisUrl(url: string): {
+    host: string;
+    port: number;
+    password?: string;
+    tls: boolean;
+  } {
+    const u = new URL(url);
+    return {
+      host: u.hostname,
+      port: u.port ? parseInt(u.port, 10) : 6379,
+      password: u.password ? decodeURIComponent(u.password) : undefined,
+      tls: u.protocol === 'rediss:',
+    };
+  }
+
   getClient(): Redis {
     if (this.client) return this.client;
 
-    const host = this.configService.get<string>('redis.host') || 'localhost';
-    const port = this.configService.get<number>('redis.port') || 6379;
-    const password = this.configService.get<string | undefined>('redis.password');
+    const redisUrl = this.configService.get<string | undefined>('redis.url');
+    const tlsEnabled = this.configService.get<boolean>('redis.tlsEnabled') ?? false;
+
+    const parsed = redisUrl ? this.parseRedisUrl(redisUrl) : undefined;
+
+    const host = parsed?.host || this.configService.get<string>('redis.host') || 'localhost';
+    const port = parsed?.port || this.configService.get<number>('redis.port') || 6379;
+    const password = parsed?.password || this.configService.get<string | undefined>('redis.password');
     const db = this.configService.get<number>('redis.db') || 0;
+    const tls = (parsed?.tls ?? false) || tlsEnabled;
 
     const client = new Redis({
       host,
@@ -24,6 +45,7 @@ export class RedisService implements OnModuleDestroy {
       db,
       maxRetriesPerRequest: 3,
       enableReadyCheck: false,
+      ...(tls ? { tls: {} } : {}),
     });
 
     client.on('connect', () => this.logger.log('Redis client connected'));

@@ -52,12 +52,24 @@ export class NotificationGateway
     }
 
     try {
+      const redisUrl = process.env.REDIS_URL;
+      const tlsEnabled =
+        (process.env.REDIS_TLS || '').toLowerCase() === 'true' ||
+        (redisUrl || '').toLowerCase().startsWith('rediss://');
+      const tlsRejectUnauthorized =
+        (process.env.REDIS_TLS_REJECT_UNAUTHORIZED || 'true').toLowerCase() !== 'false';
+
       const host = process.env.REDIS_HOST || 'localhost';
       const port = process.env.REDIS_PORT || '6379';
       const password = process.env.REDIS_PASSWORD || undefined;
 
-      const url = `redis://${host}:${port}`;
-      const pubClient = createClient({ url, password });
+      const url = redisUrl || `${tlsEnabled ? 'rediss' : 'redis'}://${host}:${port}`;
+
+      const pubClient = createClient({
+        url,
+        password,
+        ...(tlsEnabled ? { socket: { tls: true, rejectUnauthorized: tlsRejectUnauthorized } } : {}),
+      });
       const subClient = pubClient.duplicate();
 
       pubClient.on('error', (err) => this.logger.error('Redis Pub Client Error', err));

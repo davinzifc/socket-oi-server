@@ -3,10 +3,19 @@ export default () => ({
   nodeEnv: process.env.NODE_ENV || 'development',
   corsOrigin: process.env.CORS_ORIGIN || '*',
   redis: {
+    // Para AWS ElastiCache es común usar un endpoint único:
+    // - Sin TLS: redis://host:6379
+    // - Con TLS:  rediss://host:6379
+    url: process.env.REDIS_URL || undefined,
     host: process.env.REDIS_HOST || 'localhost',
     port: parseInt(process.env.REDIS_PORT || '6379', 10),
     password: process.env.REDIS_PASSWORD || undefined,
     db: parseInt(process.env.REDIS_DB || '0', 10),
+    tlsEnabled:
+      (process.env.REDIS_TLS || '').toLowerCase() === 'true' ||
+      (process.env.REDIS_URL || '').toLowerCase().startsWith('rediss://'),
+    tlsRejectUnauthorized:
+      (process.env.REDIS_TLS_REJECT_UNAUTHORIZED || 'true').toLowerCase() !== 'false',
   },
   bull: {
     limiterMax: parseInt(process.env.BULL_LIMITER_MAX || '50', 10),
