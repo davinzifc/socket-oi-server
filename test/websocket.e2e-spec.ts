@@ -20,11 +20,15 @@ describe('WebSocket no-echo policy (e2e)', () => {
         {
           provide: PresenceService,
           useValue: {
-            onConnect: jest.fn(),
-            onDisconnect: jest.fn(),
+            onConnect: jest.fn().mockResolvedValue({ becameOnline: true }),
+            onDisconnect: jest.fn().mockResolvedValue({ becameOffline: true }),
             setSection: jest.fn().mockResolvedValue({}),
             heartbeat: jest.fn().mockResolvedValue(undefined),
             cleanupStaleOnlineUsers: jest.fn().mockResolvedValue([]),
+            tryAcquireSweeperLock: jest.fn().mockResolvedValue(true),
+            cleanupExpiredUsersByLastSeenZset: jest.fn().mockResolvedValue([]),
+            bumpPresenceVersion: jest.fn().mockResolvedValue(1),
+            getPresenceVersion: jest.fn().mockResolvedValue(1),
           },
         },
       ],

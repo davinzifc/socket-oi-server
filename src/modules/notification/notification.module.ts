@@ -6,6 +6,7 @@ import { NotificationService } from './notification.service';
 import { NotificationProcessor } from './notification.processor';
 import { NotificationController } from './notification.controller';
 import { PresenceModule } from '../presence/presence.module';
+import { AdminPresenceController } from './admin.presence.controller';
 
 @Module({
   imports: [
@@ -25,7 +26,7 @@ import { PresenceModule } from '../presence/presence.module';
       }),
     }),
   ],
-  controllers: [NotificationController],
+  controllers: [NotificationController, AdminPresenceController],
   providers: [NotificationGateway, NotificationService, NotificationProcessor],
   exports: [BullModule, NotificationService, NotificationGateway],
 })

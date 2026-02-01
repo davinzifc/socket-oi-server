@@ -77,18 +77,24 @@ export class NotificationGateway
 
     this.presenceSweepTimer = setInterval(async () => {
       try {
-        const offlineUsers = await this.presenceService.cleanupStaleOnlineUsers();
+        const acquired = await this.presenceService.tryAcquireSweeperLock();
+        if (!acquired) return;
+
+        // Sweeper robusto: zset por lastSeen (y fallback al modo antiguo)
+        const offlineUsers = await this.presenceService.cleanupExpiredUsersByLastSeenZset(200);
         if (!offlineUsers.length) return;
 
         const ts = this.nowIso();
         for (const userId of offlineUsers) {
+          const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
           // Evento global para UIs (no requiere subscribe)
-          this.server.emit('presence:user_offline', { userId, ts, reason: 'ttl' });
+          this.server.emit('presence:user_offline', { userId, ts, reason: 'ttl', presenceVersion });
           // Evento de monitoring (watchers)
           this.server.to(this.presenceWatchRoom()).emit('presence:user_disconnected', {
             userId,
             ts,
             reason: 'ttl',
+            presenceVersion,
           });
         }
       } catch (e: any) {
@@ -144,7 +150,6 @@ export class NotificationGateway
         return;
       }
 
-      const wasOnline = this.isUserConnected(userId);
       this.registerUserSocket(userId, client.id);
       await client.join(`user:${userId}`);
 
@@ -154,19 +159,21 @@ export class NotificationGateway
         this.socketSection.set(client.id, sectionId);
       }
 
-      await this.presenceService.onConnect({
+      const { becameOnline } = await this.presenceService.onConnect({
         userId,
         socketId: client.id,
         sectionId: sectionId || undefined,
       });
 
       // Evento global para UIs (solo cuando pasa a online)
-      if (!wasOnline) {
+      if (becameOnline) {
+        const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
         this.server.emit('presence:user_online', {
           userId,
           socketId: client.id,
           sectionId: sectionId || undefined,
           ts: this.nowIso(),
+          presenceVersion,
         });
       }
 
@@ -200,17 +207,18 @@ export class NotificationGateway
 
       this.socketSection.delete(client.id);
       this.unregisterUserSocket(userId, client.id);
-      await this.presenceService.onDisconnect(client.id);
-
+      const { becameOffline } = await this.presenceService.onDisconnect(client.id);
       const remainingSockets = this.userSockets.get(userId)?.size || 0;
 
       // Evento global para UIs (solo cuando el usuario ya no tiene sockets)
-      if (remainingSockets <= 0) {
+      if (becameOffline) {
+        const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
         this.server.emit('presence:user_offline', {
           userId,
           socketId: client.id,
           ts: this.nowIso(),
           reason: 'disconnect',
+          presenceVersion,
         });
       }
 
@@ -218,6 +226,9 @@ export class NotificationGateway
         userId,
         socketId: client.id,
         ts: this.nowIso(),
+        ...(becameOffline
+          ? { reason: 'disconnect', presenceVersion: await this.presenceService.getPresenceVersion(userId) }
+          : {}),
       });
       this.logger.log(
         `User ${userId} disconnected socket ${client.id} (Remaining sockets: ${remainingSockets})`,
@@ -225,6 +236,10 @@ export class NotificationGateway
     } catch (error: any) {
       this.logger.error(`Error handling disconnect: ${error.message}`, error.stack);
     }
+  }
+
+  disconnectUser(userId: string, close: boolean = true): void {
+    this.server.in(`user:${userId}`).disconnectSockets(close);
   }
 
   onModuleDestroy() {

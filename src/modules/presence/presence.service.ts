@@ -10,12 +10,15 @@ export interface PresenceState {
   }>;
 }
 
+export type PresenceStatus = 'ONLINE' | 'IDLE' | 'OFFLINE';
+
 @Injectable()
 export class PresenceService {
   private readonly logger = new Logger(PresenceService.name);
 
   // TTL “de seguridad” para limpiar estado si el proceso muere sin disconnect
   private readonly SOCKET_TTL_SECONDS = parseInt(process.env.PRESENCE_SOCKET_TTL_SECONDS || '600', 10);
+  private readonly IDLE_AFTER_SECONDS = parseInt(process.env.PRESENCE_IDLE_AFTER_SECONDS || '60', 10);
 
   constructor(private readonly redisService: RedisService) { }
 
@@ -33,6 +36,14 @@ export class PresenceService {
 
   private userLastSeenKey(userId: string) {
     return `presence:user:${userId}:lastSeen`;
+  }
+
+  private lastSeenZsetKey() {
+    return `presence:lastSeen:z`;
+  }
+
+  private presenceVersionKey(userId: string) {
+    return `presence:user:${userId}:presenceVersion`;
   }
 
   private sectionCountsKey(sectionId: string) {
@@ -61,6 +72,59 @@ export class PresenceService {
 
   private activeChatsKey() {
     return `presence:chats:active`;
+  }
+
+  private sweeperLockKey() {
+    return `presence:sweeper:lock`;
+  }
+
+  private offlineAfterSeconds(): number {
+    const n = parseInt(process.env.PRESENCE_OFFLINE_AFTER_SECONDS || '', 10);
+    return Number.isFinite(n) && n > 0 ? n : this.SOCKET_TTL_SECONDS;
+  }
+
+  private nowMs(): number {
+    return Date.now();
+  }
+
+  async tryAcquireSweeperLock(): Promise<boolean> {
+    const redis = this.redisService.getClient();
+    const ttlMs = parseInt(process.env.PRESENCE_SWEEP_LOCK_TTL_MS || '15000', 10);
+    if (ttlMs <= 0) return true; // lock deshabilitado
+
+    const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const res = await redis.set(this.sweeperLockKey(), token, 'PX', ttlMs, 'NX');
+    return res === 'OK';
+  }
+
+  async bumpPresenceVersion(userId: string): Promise<number> {
+    const redis = this.redisService.getClient();
+    const v = await redis.incr(this.presenceVersionKey(userId));
+    // Mantenerlo mientras el usuario esté activo y un poco más
+    const ttl = Math.max(this.offlineAfterSeconds() * 2, 120);
+    await redis.expire(this.presenceVersionKey(userId), ttl);
+    return v;
+  }
+
+  async getPresenceVersion(userId: string): Promise<number> {
+    const redis = this.redisService.getClient();
+    const v = await redis.get(this.presenceVersionKey(userId));
+    return parseInt(v || '0', 10) || 0;
+  }
+
+  async getUserLastSeenAt(userId: string): Promise<string | null> {
+    const redis = this.redisService.getClient();
+    return await redis.get(this.userLastSeenKey(userId));
+  }
+
+  async getUserStatus(userId: string): Promise<PresenceStatus> {
+    const redis = this.redisService.getClient();
+    const online = await redis.sismember(this.onlineUsersKey(), userId);
+    if (!online) return 'OFFLINE';
+    const score = await redis.zscore(this.lastSeenZsetKey(), userId);
+    if (!score) return 'IDLE';
+    const ageSeconds = (this.nowMs() - parseInt(score, 10)) / 1000;
+    return ageSeconds >= this.IDLE_AFTER_SECONDS ? 'IDLE' : 'ONLINE';
   }
 
   /**
@@ -100,16 +164,152 @@ export class PresenceService {
     }
 
     if (removed.length) {
+      // También limpiar presencia “colateral” (secciones/chats) para evitar users pegados en listados.
+      // Con picos bajos (60-90 usuarios) podemos hacerlo de manera simple sin afectar performance.
+      const [activeSections, activeChats] = await Promise.all([
+        redis.smembers(this.activeSectionsKey()),
+        redis.smembers(this.activeChatsKey()),
+      ]);
+
+      if (activeSections.length || activeChats.length) {
+        const p = redis.pipeline();
+        for (const userId of removed) {
+          for (const sectionId of activeSections) {
+            p.srem(this.sectionUsersKey(sectionId), userId);
+            p.hdel(this.sectionCountsKey(sectionId), userId);
+          }
+          for (const chatId of activeChats) {
+            p.srem(this.chatUsersKey(chatId), userId);
+            p.hdel(this.chatCountsKey(chatId), userId);
+          }
+        }
+        await p.exec();
+
+        // Recalcular activos (si quedaron vacíos)
+        const check = redis.pipeline();
+        for (const sectionId of activeSections) check.scard(this.sectionUsersKey(sectionId));
+        for (const chatId of activeChats) check.scard(this.chatUsersKey(chatId));
+        const counts = await check.exec();
+
+        const emptySections: string[] = [];
+        const emptyChats: string[] = [];
+        let idx = 0;
+        for (const sectionId of activeSections) {
+          const n = (counts?.[idx]?.[1] as number) || 0;
+          if (n <= 0) emptySections.push(sectionId);
+          idx++;
+        }
+        for (const chatId of activeChats) {
+          const n = (counts?.[idx]?.[1] as number) || 0;
+          if (n <= 0) emptyChats.push(chatId);
+          idx++;
+        }
+        if (emptySections.length) await redis.srem(this.activeSectionsKey(), ...emptySections);
+        if (emptyChats.length) await redis.srem(this.activeChatsKey(), ...emptyChats);
+      }
+
       this.logger.debug(`cleanupStaleOnlineUsers removed=${removed.length}`);
     }
     return removed;
+  }
+
+  /**
+   * Sweeper eficiente: usa ZSET por lastSeen para traer solo expirados.
+   * Retorna userIds marcados offline (solo una vez gracias a SREM).
+   */
+  async cleanupExpiredUsersByLastSeenZset(limit: number = 200): Promise<string[]> {
+    const redis = this.redisService.getClient();
+    const thresholdMs = this.nowMs() - this.offlineAfterSeconds() * 1000;
+
+    const candidates = await redis.zrangebyscore(
+      this.lastSeenZsetKey(),
+      '-inf',
+      thresholdMs,
+      'LIMIT',
+      0,
+      limit,
+    );
+    if (!candidates.length) return [];
+
+    // "Claim" offline: solo el proceso que logra SREM=1 emitirá evento.
+    const pipeline = redis.pipeline();
+    for (const u of candidates) pipeline.srem(this.onlineUsersKey(), u);
+    const sremRes = await pipeline.exec();
+
+    const removed: string[] = [];
+    candidates.forEach((u, idx) => {
+      const n = (sremRes?.[idx]?.[1] as number) || 0;
+      if (n === 1) removed.push(u);
+    });
+    if (!removed.length) return [];
+
+    // Limpieza de keys del usuario y zset
+    const p = redis.pipeline();
+    for (const userId of removed) {
+      p.del(this.userSocketsKey(userId));
+      p.del(this.userLastSeenKey(userId));
+      p.zrem(this.lastSeenZsetKey(), userId);
+      // presenceVersion: dejamos que expire por TTL (si existe) o cuando se bumpée
+    }
+    await p.exec();
+
+    // Limpieza colateral (secciones/chats)
+    await this.cleanupUsersFromMemberships(removed);
+
+    this.logger.debug(`cleanupExpiredUsersByLastSeenZset removed=${removed.length}`);
+    return removed;
+  }
+
+  private async cleanupUsersFromMemberships(userIds: string[]): Promise<void> {
+    if (!userIds.length) return;
+    const redis = this.redisService.getClient();
+    const [activeSections, activeChats] = await Promise.all([
+      redis.smembers(this.activeSectionsKey()),
+      redis.smembers(this.activeChatsKey()),
+    ]);
+    if (!activeSections.length && !activeChats.length) return;
+
+    const p = redis.pipeline();
+    for (const userId of userIds) {
+      for (const sectionId of activeSections) {
+        p.srem(this.sectionUsersKey(sectionId), userId);
+        p.hdel(this.sectionCountsKey(sectionId), userId);
+      }
+      for (const chatId of activeChats) {
+        p.srem(this.chatUsersKey(chatId), userId);
+        p.hdel(this.chatCountsKey(chatId), userId);
+      }
+    }
+    await p.exec();
+
+    // Recalcular activas (si quedaron vacías)
+    const check = redis.pipeline();
+    for (const sectionId of activeSections) check.scard(this.sectionUsersKey(sectionId));
+    for (const chatId of activeChats) check.scard(this.chatUsersKey(chatId));
+    const counts = await check.exec();
+
+    const emptySections: string[] = [];
+    const emptyChats: string[] = [];
+    let idx = 0;
+    for (const sectionId of activeSections) {
+      const n = (counts?.[idx]?.[1] as number) || 0;
+      if (n <= 0) emptySections.push(sectionId);
+      idx++;
+    }
+    for (const chatId of activeChats) {
+      const n = (counts?.[idx]?.[1] as number) || 0;
+      if (n <= 0) emptyChats.push(chatId);
+      idx++;
+    }
+    if (emptySections.length) await redis.srem(this.activeSectionsKey(), ...emptySections);
+    if (emptyChats.length) await redis.srem(this.activeChatsKey(), ...emptyChats);
   }
 
   async onConnect(params: {
     userId: string;
     socketId: string;
     sectionId?: string;
-  }): Promise<void> {
+  }): Promise<{ becameOnline: boolean }> {
     const redis = this.redisService.getClient();
     const { userId, socketId, sectionId } = params;
 
@@ -117,6 +317,11 @@ export class PresenceService {
     const usk = this.userSocketsKey(userId);
 
     const connectedAt = new Date().toISOString();
+    const nowMs = this.nowMs();
+
+    // transición ONLINE: el primero que logra SADD=1 es el que debe emitir user_online
+    const becameOnline = (await redis.sadd(this.onlineUsersKey(), userId)) === 1;
+
     const pipeline = redis.pipeline();
 
     pipeline.hset(sk, {
@@ -128,9 +333,9 @@ export class PresenceService {
     pipeline.expire(sk, this.SOCKET_TTL_SECONDS);
     pipeline.sadd(usk, socketId);
     pipeline.expire(usk, this.SOCKET_TTL_SECONDS);
-    pipeline.sadd(this.onlineUsersKey(), userId);
     // lastSeen por usuario (TTL) para evitar "usuarios pegados" si no llega disconnect
     pipeline.set(this.userLastSeenKey(userId), connectedAt, 'EX', this.SOCKET_TTL_SECONDS);
+    pipeline.zadd(this.lastSeenZsetKey(), nowMs, userId);
 
     if (sectionId) {
       pipeline.hincrby(this.sectionCountsKey(sectionId), userId, 1);
@@ -143,6 +348,7 @@ export class PresenceService {
     }
 
     await pipeline.exec();
+    return { becameOnline };
   }
 
   /**
@@ -163,6 +369,7 @@ export class PresenceService {
     pipeline.expire(sk, this.SOCKET_TTL_SECONDS);
     pipeline.expire(this.userSocketsKey(userId), this.SOCKET_TTL_SECONDS);
     pipeline.set(this.userLastSeenKey(userId), now, 'EX', this.SOCKET_TTL_SECONDS);
+    pipeline.zadd(this.lastSeenZsetKey(), this.nowMs(), userId);
 
     // si viene sectionId, también mantenemos membership activo
     if (sectionId) {
@@ -178,14 +385,14 @@ export class PresenceService {
     await pipeline.exec();
   }
 
-  async onDisconnect(socketId: string): Promise<void> {
+  async onDisconnect(socketId: string): Promise<{ becameOffline: boolean; userId?: string }> {
     const redis = this.redisService.getClient();
     const sk = this.socketKey(socketId);
 
     const data = await redis.hgetall(sk);
     if (!data?.userId) {
       // ya expiró o nunca se registró
-      return;
+      return { becameOffline: false };
     }
 
     const userId = data.userId;
@@ -246,13 +453,17 @@ export class PresenceService {
 
     const remainingSockets = await redis.scard(this.userSocketsKey(userId));
     if (remainingSockets <= 0) {
-      await redis
+      const srem = await redis
         .pipeline()
         .srem(this.onlineUsersKey(), userId)
         .del(this.userSocketsKey(userId))
         .del(this.userLastSeenKey(userId))
+        .zrem(this.lastSeenZsetKey(), userId)
         .exec();
+      const removedFromOnline = ((srem?.[0]?.[1] as number) || 0) === 1;
+      return { becameOffline: removedFromOnline, userId };
     }
+    return { becameOffline: false, userId };
   }
 
   async setSection(params: { socketId: string; sectionId: string }): Promise<{ previousSectionId?: string }> {

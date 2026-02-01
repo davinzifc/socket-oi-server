@@ -68,7 +68,10 @@ cp .env.example .env
 - **Auth**: `AUTH_REQUIRED=false` (en dev) / `true` (exige header Authorization)
 - **Presencia**:
   - `PRESENCE_SOCKET_TTL_SECONDS` (cuánto tarda en “caer” un usuario sin heartbeat/disconnect)
+  - `PRESENCE_IDLE_AFTER_SECONDS` (si no hay heartbeat reciente, el usuario puede verse como IDLE)
+  - `PRESENCE_OFFLINE_AFTER_SECONDS` (umbral del sweeper por lastSeen; si no se setea usa TTL)
   - `PRESENCE_SWEEP_INTERVAL_MS` (cada cuánto se detecta y emite `presence:user_offline` por TTL)
+  - `PRESENCE_SWEEP_LOCK_TTL_MS` (si hay multi-instancia: evita sweeper duplicado)
 - **Swagger**: `SWAGGER_ENABLED=true` (UI en `/docs`)
 
 ---
@@ -207,8 +210,8 @@ socket.on("system_announcement", (data) =>
 );
 
 // presencia "push" (para actualizar UI sin refrescar)
-socket.on("presence:user_online", (e) => console.log("user online", e)); // { userId, ts, ... }
-socket.on("presence:user_offline", (e) => console.log("user offline", e)); // { userId, ts, reason }
+socket.on("presence:user_online", (e) => console.log("user online", e)); // { userId, ts, presenceVersion, ... }
+socket.on("presence:user_offline", (e) => console.log("user offline", e)); // { userId, ts, reason, presenceVersion }
 ```
 
 ### Paso 3 — Presencia por secciones (tracking de “en qué página está”)
@@ -668,6 +671,12 @@ Este repo expone métodos en `NotificationGateway` para emitir por:
 curl -sS "http://localhost:3000/presence/online"
 ```
 
+`GET /presence/online/detailed` (incluye `status` y `presenceVersion`)
+
+```bash
+curl -sS "http://localhost:3000/presence/online/detailed"
+```
+
 ### 9.2 Secciones activas (con al menos 1 usuario)
 
 `GET /presence/sections`
@@ -707,6 +716,15 @@ curl -sS "http://localhost:3000/presence/chat/room-1"
 ```bash
 curl -sS "http://localhost:3000/presence/user/user123"
 ```
+
+---
+
+## 9.7 Admin (kick/dump) — uso profesional
+
+> Requiere `Authorization` si `AUTH_REQUIRED=true`.
+
+- `POST /admin/presence/disconnect/:userId` (desconecta todas las sesiones WS del usuario)
+- `GET /admin/presence/user/:userId` (dump de presencia: status + sockets + presenceVersion)
 
 ---
 

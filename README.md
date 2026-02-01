@@ -138,11 +138,19 @@ docker compose -f docker-compose.dev.yml up --build
 ## Presencia (API)
 
 - `GET /presence/online` (usuarios online)
+- `GET /presence/online/detailed` (online con status/lastSeen/presenceVersion)
 - `GET /presence/sections` (secciones activas)
 - `GET /presence/section/:sectionId` (usuarios presentes en una sección)
 - `GET /presence/chats` (chats activos)
 - `GET /presence/chat/:chatId` (usuarios presentes en un chat)
 - `GET /presence/user/:userId` (sockets/secciones del usuario)
+
+## Admin (Presence)
+
+> Requiere `Authorization` si `AUTH_REQUIRED=true`.
+
+- `POST /admin/presence/disconnect/:userId` (kick WS)
+- `GET /admin/presence/user/:userId` (dump)
 
 ## Presencia (config recomendada)
 
@@ -151,6 +159,9 @@ Para que “online/offline” se actualice rápido ante cierres abruptos:
 - `SOCKET_PING_TIMEOUT` / `SOCKET_PING_INTERVAL`: define cuánto tarda Socket.IO en detectar que el cliente ya no responde.
 - `PRESENCE_SOCKET_TTL_SECONDS`: TTL de presencia en Redis (recomendado **ligeramente mayor** al ping timeout).
 - `PRESENCE_SWEEP_INTERVAL_MS`: intervalo del sweeper que emite `presence:user_offline` cuando expira el TTL.
+- `PRESENCE_SWEEP_LOCK_TTL_MS`: lock del sweeper (útil si corres múltiples instancias).
+- `PRESENCE_IDLE_AFTER_SECONDS`: umbral para mostrar usuario como `IDLE`.
+- `PRESENCE_OFFLINE_AFTER_SECONDS`: umbral del sweeper por `lastSeen` (si no se setea usa TTL).
 
 Valores típicos en dev:
 

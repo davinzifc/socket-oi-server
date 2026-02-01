@@ -19,6 +19,27 @@ export class PresenceController {
     return { count, users };
   }
 
+  @Get('online/detailed')
+  @ApiOperation({ summary: 'Listar usuarios online con estado (ONLINE/IDLE) y lastSeen' })
+  @ApiQuery({ name: 'limit', required: false, example: 200 })
+  async onlineDetailed(@Query('limit') limit?: string) {
+    const n = limit ? parseInt(limit, 10) : 200;
+    const users = await this.presenceService.getOnlineUsers(n);
+
+    const detailed = await Promise.all(
+      users.map(async (userId) => {
+        const [status, lastSeenAt, presenceVersion] = await Promise.all([
+          this.presenceService.getUserStatus(userId),
+          this.presenceService.getUserLastSeenAt(userId),
+          this.presenceService.getPresenceVersion(userId),
+        ]);
+        return { userId, status, lastSeenAt, presenceVersion };
+      }),
+    );
+
+    return { count: detailed.length, users: detailed };
+  }
+
   @Get('sections')
   @ApiOperation({ summary: 'Listar secciones activas (con al menos 1 usuario)' })
   @ApiQuery({ name: 'limit', required: false, example: 200 })
