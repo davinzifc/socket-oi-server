@@ -97,25 +97,25 @@ REDIS_REQUIRED=true
 Desde la raíz del repo:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.redis.yml up -d
+docker compose up -d redis
 ```
 
 Detener:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.redis.yml stop redis
+docker compose stop redis
 ```
 
 Bajar y borrar contenedor:
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.redis.yml down
+docker compose down
 ```
 
 Bajar y **borrar datos** (volumen):
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.redis.yml down -v
+docker compose down -v
 ```
 
 ### 3.2 Problemas comunes con Docker
@@ -179,6 +179,10 @@ import { io } from "socket.io-client";
 
 const socket = io("http://localhost:3000", {
   transports: ["websocket", "polling"],
+  // Producción (recomendado si AUTH_REQUIRED=true):
+  // auth: { token: "Bearer <JWT_HS256>" },
+  //
+  // Desarrollo (solo si AUTH_REQUIRED=false): identificación por query params (modo demo)
   query: {
     userId: "user123",
     // opcional: sección inicial
@@ -209,9 +213,11 @@ socket.on("system_announcement", (data) =>
   console.log("system_announcement", data),
 );
 
-// presencia "push" (para actualizar UI sin refrescar)
-socket.on("presence:user_online", (e) => console.log("user online", e)); // { userId, ts, presenceVersion, ... }
-socket.on("presence:user_offline", (e) => console.log("user offline", e)); // { userId, ts, reason, presenceVersion }
+// presencia "push":
+// Importante: estos eventos se envían SOLO a sockets que hagan `presence:subscribe` (watchers/admin),
+// para evitar fanout global (performance).
+socket.on("presence:user_online", (e) => console.log("user online", e)); // watcher-only
+socket.on("presence:user_offline", (e) => console.log("user offline", e)); // watcher-only
 ```
 
 ### Paso 3 — Presencia por secciones (tracking de “en qué página está”)
@@ -292,7 +298,7 @@ socket.emit(
 );
 ```
 
-> Recomendación profesional: en producción restringe `broadcast:emit` a roles/admin.
+> Producción: `broadcast:emit` está **restringido a admins** (configurable con `AUTH_ADMIN_USER_IDS`).
 
 ---
 
@@ -317,6 +323,8 @@ curl -sS http://localhost:3000/health
 Si `AUTH_REQUIRED=true` debes enviar:
 
 `Authorization: Bearer <token>`
+
+En producción el token debe ser **JWT HS256** y debes definir `AUTH_JWT_SECRET` en el `.env`.
 
 En dev puedes dejar `AUTH_REQUIRED=false`.
 
@@ -573,6 +581,11 @@ socket.emit("section:emit", { event: "typing", data: { isTyping: true } });
 
 El server re-emite a `section:{sectionId}` excluyendo al emisor.
 
+Notas importantes:
+
+- En producción, si envías `sectionId`, **solo se permite** si coincide con la sección actual del socket.
+- Solo admins pueden forzar emitir a una sección distinta (ver `AUTH_ADMIN_USER_IDS`).
+
 ### 7.6.4 Broadcast: emitir a todos (sin echo)
 
 **Cliente emite:**
@@ -590,6 +603,11 @@ socket.emit("broadcast:emit", {
 ```
 
 El server re-emite a todos los conectados excluyendo al emisor.
+
+Notas importantes:
+
+- En producción, `broadcast:emit` está **permitido solo para admins** (ver `AUTH_ADMIN_USER_IDS`).
+- Hay **rate limiting** y **límite de tamaño de payload**; si excedes, el ack puede traer `rate_limited` o `payload_too_large`.
 
 ---
 
@@ -613,12 +631,18 @@ socket.emit("presence:subscribe", {}, (ack) =>
 );
 ```
 
+> Producción: si `AUTH_REQUIRED=true`, el watcher debe ser **admin** (`AUTH_ADMIN_USER_IDS`), si no el ack devuelve `{ ok:false, error:"forbidden" }`.
+
 ### 7.7.2 Eventos que recibirá el watcher
 
 - `presence:user_connected`
   - `{ userId, socketId, sectionId?, ts }`
 - `presence:user_disconnected`
-  - `{ userId, socketId, ts }`
+  - `{ userId, socketId, ts, reason?, presenceVersion? }`
+- `presence:user_online`
+  - `{ userId, socketId, sectionId?, ts, presenceVersion }`
+- `presence:user_offline`
+  - `{ userId, ts, reason, presenceVersion }`
 - `presence:chat_joined`
   - `{ userId, socketId, chatId, ts }`
 - `presence:chat_left`

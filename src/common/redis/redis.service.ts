@@ -22,12 +22,26 @@ export class RedisService implements OnModuleDestroy {
       port,
       password,
       db,
+      // Evita fallos duros en pipelines largos, pero tampoco "cuelga" indefinidamente.
       maxRetriesPerRequest: 3,
-      enableReadyCheck: false,
+      enableReadyCheck: true,
+      retryStrategy: (times) => {
+        // backoff exponencial suave (ms), con tope
+        return Math.min(times * 50, 2000);
+      },
+      reconnectOnError: (err) => {
+        // Algunos errores ameritan reconexión inmediata.
+        const msg = (err?.message || '').toLowerCase();
+        return msg.includes('read only') || msg.includes('connection is closed');
+      },
     });
 
     client.on('connect', () => this.logger.log('Redis client connected'));
+    client.on('ready', () => this.logger.log('Redis client ready'));
+    client.on('reconnecting', () => this.logger.warn('Redis client reconnecting'));
+    client.on('close', () => this.logger.warn('Redis client connection closed'));
     client.on('error', (err) => this.logger.error('Redis client error', err));
+    client.on('end', () => this.logger.warn('Redis client connection ended'));
 
     this.client = client;
     return client;

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import type { Queue, JobOptions } from 'bull';
 import { ConfigService } from '@nestjs/config';
+import { chunkArray } from '../../common/utils/array';
 
 export interface NotificationJob {
   type: 'single' | 'multiple' | 'broadcast' | 'section' | 'chat';
@@ -107,7 +108,7 @@ export class NotificationService {
       return;
     }
 
-    const batches = this.chunkArray(userIds, this.BATCH_SIZE);
+    const batches = chunkArray(userIds, this.BATCH_SIZE);
     const jobs = batches.map((batch, index) => ({
       name: 'send-notification',
       data: {
@@ -257,12 +258,5 @@ export class NotificationService {
     this.logger.log('Notification queue resumed');
   }
 
-  private chunkArray<T>(array: T[], size: number): T[][] {
-    const chunks: T[][] = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
-  }
 }
 

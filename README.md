@@ -32,7 +32,7 @@ Servidor: `http://localhost:3000`
 
 ## Endpoints principales
 
-> Nota: Por defecto en `.env.example` `AUTH_REQUIRED=false`. Si lo activas, debes enviar header `Authorization`.
+> Nota: Por defecto en `.env.example` `AUTH_REQUIRED=false`. Si lo activas, debes enviar `Authorization: Bearer <JWT>` (HS256) y definir `AUTH_JWT_SECRET`.
 
 - `GET /health`
 - `POST /notifications/send`
@@ -54,7 +54,9 @@ curl -X POST "http://localhost:3000/notifications/send" \
 ## WebSocket / Socket.IO
 
 - Conexión: `ws://localhost:3000`
-- Identificación (demo): query param `userId`
+- Identificación:
+  - **Producción (`AUTH_REQUIRED=true`)**: `handshake.auth.token` con `Bearer <JWT>`. El `userId` sale del claim `sub` (o `userId`).
+  - **Desarrollo (`AUTH_REQUIRED=false`)**: se permite `query.userId` (modo demo).
 - Room: `user:{userId}`
 
 ### Presencia por secciones (rooms)
@@ -85,18 +87,26 @@ curl -X POST "http://localhost:3000/notifications/send" \
 - A sección actual (sin echo):
   - Evento `section:emit` `{ event, data, sectionId? }` → se emite a `section:{sectionId}`
 - Broadcast global (sin echo):
-  - Evento `broadcast:emit` `{ event, data }` → se emite a todos los conectados menos al emisor
+  - Evento `broadcast:emit` `{ event, data }` → **solo admins** (ver `AUTH_ADMIN_USER_IDS`)
+
+> Importante: los eventos de presencia (`presence:user_online/offline`, etc.) ahora se envían **solo** a sockets que llamen `presence:subscribe` (y en producción, solo admins).
 
 Ejemplo (pseudo):
 
 ```js
 import { io } from "socket.io-client";
 const socket = io("http://localhost:3000", {
+  // Producción:
+  // auth: { token: "Bearer <JWT_HS256>" },
+  // Dev (si AUTH_REQUIRED=false):
   query: { userId: "user123", sectionId: "home" },
 });
 socket.on("connected", (payload) => console.log("connected", payload));
 socket.on("new_message", (data) => console.log("new_message", data));
 socket.on("error", (e) => console.log("error", e));
+
+// Suscribirse a presencia (solo admins si AUTH_REQUIRED=true)
+socket.emit("presence:subscribe");
 
 // cambiar sección
 socket.emit("presence:setSection", { sectionId: "chat" }, (ack) =>

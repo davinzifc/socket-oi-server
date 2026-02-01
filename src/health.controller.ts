@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bull';
 import type { Queue } from 'bull';
 
@@ -16,12 +16,12 @@ export class HealthController {
         timestamp: new Date().toISOString(),
       };
     } catch (error: any) {
-      return {
+      throw new ServiceUnavailableException({
         status: 'error',
         redis: 'disconnected',
         error: error?.message ?? 'unknown_error',
         timestamp: new Date().toISOString(),
-      };
+      });
     }
   }
 }

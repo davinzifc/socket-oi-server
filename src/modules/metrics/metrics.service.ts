@@ -7,6 +7,23 @@ import { NotificationService } from '../notification/notification.service';
 export class MetricsService {
   private readonly registry = new Registry();
 
+  private lastQueueStats:
+    | { waiting: number; active: number; failed: number; delayed?: number; completed?: number }
+    | null = null;
+  private lastQueueStatsAtMs = 0;
+  private readonly queueStatsTtlMs = 5000;
+
+  private async getCachedQueueStats() {
+    const now = Date.now();
+    if (this.lastQueueStats && now - this.lastQueueStatsAtMs < this.queueStatsTtlMs) {
+      return this.lastQueueStats;
+    }
+    const stats = await this.notificationService.getQueueStats();
+    this.lastQueueStats = stats;
+    this.lastQueueStatsAtMs = now;
+    return stats;
+  }
+
   private readonly onlineUsersGauge = new Gauge({
     name: 'presence_online_users',
     help: 'Usuarios online (según PresenceService/Redis)',
@@ -22,8 +39,8 @@ export class MetricsService {
     help: 'Cantidad de secciones activas (con al menos 1 usuario)',
     registers: [this.registry],
     collect: async () => {
-      const sections = await this.presenceService.getActiveSections(100000);
-      this.activeSectionsGauge.set(sections.length);
+      const n = await this.presenceService.getActiveSectionsCount();
+      this.activeSectionsGauge.set(n);
     },
   });
 
@@ -32,8 +49,8 @@ export class MetricsService {
     help: 'Cantidad de chats activos (con al menos 1 usuario)',
     registers: [this.registry],
     collect: async () => {
-      const chats = await this.presenceService.getActiveChats(100000);
-      this.activeChatsGauge.set(chats.length);
+      const n = await this.presenceService.getActiveChatsCount();
+      this.activeChatsGauge.set(n);
     },
   });
 
@@ -42,7 +59,7 @@ export class MetricsService {
     help: 'Jobs waiting en cola notifications',
     registers: [this.registry],
     collect: async () => {
-      const stats = await this.notificationService.getQueueStats();
+      const stats = await this.getCachedQueueStats();
       this.bullWaitingGauge.set(stats.waiting);
     },
   });
@@ -52,7 +69,7 @@ export class MetricsService {
     help: 'Jobs active en cola notifications',
     registers: [this.registry],
     collect: async () => {
-      const stats = await this.notificationService.getQueueStats();
+      const stats = await this.getCachedQueueStats();
       this.bullActiveGauge.set(stats.active);
     },
   });
@@ -62,7 +79,7 @@ export class MetricsService {
     help: 'Jobs failed en cola notifications',
     registers: [this.registry],
     collect: async () => {
-      const stats = await this.notificationService.getQueueStats();
+      const stats = await this.getCachedQueueStats();
       this.bullFailedGauge.set(stats.failed);
     },
   });

@@ -1,9 +1,12 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
-import { ApiOperation, ApiParam, ApiQuery, ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiOperation, ApiParam, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { PresenceService } from './presence.service';
+import { AuthGuard } from '../../common/guards/auth.guard';
 
 @ApiTags('Presence')
 @Controller('presence')
+@ApiBearerAuth()
+@UseGuards(AuthGuard)
 export class PresenceController {
   constructor(private readonly presenceService: PresenceService) { }
 
@@ -25,18 +28,7 @@ export class PresenceController {
   async onlineDetailed(@Query('limit') limit?: string) {
     const n = limit ? parseInt(limit, 10) : 200;
     const users = await this.presenceService.getOnlineUsers(n);
-
-    const detailed = await Promise.all(
-      users.map(async (userId) => {
-        const [status, lastSeenAt, presenceVersion] = await Promise.all([
-          this.presenceService.getUserStatus(userId),
-          this.presenceService.getUserLastSeenAt(userId),
-          this.presenceService.getPresenceVersion(userId),
-        ]);
-        return { userId, status, lastSeenAt, presenceVersion };
-      }),
-    );
-
+    const detailed = await this.presenceService.getUsersPresenceDetails(users);
     return { count: detailed.length, users: detailed };
   }
 

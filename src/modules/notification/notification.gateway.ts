@@ -10,10 +10,16 @@ import {
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
 import { Logger, UseFilters, OnModuleDestroy } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { WsExceptionFilter } from '../../common/filters/ws-exception.filter';
 import { createAdapter } from '@socket.io/redis-adapter';
 import { createClient } from 'redis';
 import { PresenceService } from '../presence/presence.service';
+import {
+  extractBearerToken,
+  getUserIdFromJwtPayload,
+  verifyJwtHs256,
+} from '../../common/auth/jwt';
 
 const PING_TIMEOUT = parseInt(process.env.SOCKET_PING_TIMEOUT || '60000', 10);
 const PING_INTERVAL = parseInt(process.env.SOCKET_PING_INTERVAL || '25000', 10);
@@ -45,7 +51,13 @@ export class NotificationGateway
   private readonly socketSection = new Map<string, string>(); // socketId -> sectionId (cache local)
   private presenceSweepTimer?: NodeJS.Timeout;
 
-  constructor(private readonly presenceService: PresenceService) { }
+  // Rate limiting in-memory (best effort).
+  private readonly rl = new Map<string, { resetAt: number; count: number }>();
+
+  constructor(
+    private readonly presenceService: PresenceService,
+    private readonly configService: ConfigService,
+  ) { }
 
   private nowIso() {
     return new Date().toISOString();
@@ -71,6 +83,55 @@ export class NotificationGateway
     return 'presence:watch';
   }
 
+  private isAdminUser(userId: string): boolean {
+    const admins = this.configService.get<string[]>('auth.adminUserIds') ?? [];
+    return admins.includes(userId);
+  }
+
+  private getWsRateLimitConfig() {
+    const max = this.configService.get<number>('ws.rateLimit.max') ?? 60;
+    const windowMs = this.configService.get<number>('ws.rateLimit.windowMs') ?? 10000;
+    const broadcastMax = this.configService.get<number>('ws.rateLimit.broadcastMax') ?? 5;
+    return { max, windowMs, broadcastMax };
+  }
+
+  private consumeRateLimit(client: Socket, eventName: string): boolean {
+    const { max, windowMs, broadcastMax } = this.getWsRateLimitConfig();
+    const limit = eventName === 'broadcast:emit' ? broadcastMax : max;
+    if (limit <= 0 || windowMs <= 0) return true;
+
+    const key = `${client.id}:${eventName}`;
+    const now = Date.now();
+    const cur = this.rl.get(key);
+    if (!cur || now >= cur.resetAt) {
+      this.rl.set(key, { resetAt: now + windowMs, count: 1 });
+      return true;
+    }
+    cur.count += 1;
+    return cur.count <= limit;
+  }
+
+  private validateClientEmitEventName(event: string): boolean {
+    if (!/^[a-zA-Z0-9:_-]{1,64}$/.test(event)) return false;
+    if (event.startsWith('presence:')) return false;
+    if (event.startsWith('admin:')) return false;
+
+    const allow = this.configService.get<string[]>('ws.allowedClientEmitEvents') ?? [];
+    if (allow.length) return allow.includes(event);
+    return true;
+  }
+
+  private isPayloadWithinLimit(payload: unknown): boolean {
+    const maxBytes = this.configService.get<number>('ws.payloadMaxBytes') ?? 65536;
+    if (maxBytes <= 0) return true;
+    try {
+      const raw = JSON.stringify(payload);
+      return Buffer.byteLength(raw, 'utf8') <= maxBytes;
+    } catch {
+      return false;
+    }
+  }
+
   private startPresenceSweeper() {
     if (this.presenceSweepTimer) return;
     if (PRESENCE_SWEEP_INTERVAL_MS <= 0) return;
@@ -87,9 +148,15 @@ export class NotificationGateway
         const ts = this.nowIso();
         for (const userId of offlineUsers) {
           const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
-          // Evento global para UIs (no requiere subscribe)
-          this.server.emit('presence:user_offline', { userId, ts, reason: 'ttl', presenceVersion });
-          // Evento de monitoring (watchers)
+          // Emitir solo a clientes suscritos a presencia (evita fanout global).
+          this.server.to(this.presenceWatchRoom()).emit('presence:user_offline', {
+            userId,
+            ts,
+            reason: 'ttl',
+            presenceVersion,
+          });
+
+          // Evento de monitoring (watchers) (alias)
           this.server.to(this.presenceWatchRoom()).emit('presence:user_disconnected', {
             userId,
             ts,
@@ -165,10 +232,10 @@ export class NotificationGateway
         sectionId: sectionId || undefined,
       });
 
-      // Evento global para UIs (solo cuando pasa a online)
+      // Evento para UIs suscritas a presencia (solo cuando pasa a online)
       if (becameOnline) {
         const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
-        this.server.emit('presence:user_online', {
+        this.server.to(this.presenceWatchRoom()).emit('presence:user_online', {
           userId,
           socketId: client.id,
           sectionId: sectionId || undefined,
@@ -210,10 +277,10 @@ export class NotificationGateway
       const { becameOffline } = await this.presenceService.onDisconnect(client.id);
       const remainingSockets = this.userSockets.get(userId)?.size || 0;
 
-      // Evento global para UIs (solo cuando el usuario ya no tiene sockets)
+      // Evento para UIs suscritas a presencia (solo cuando el usuario ya no tiene sockets)
       if (becameOffline) {
         const presenceVersion = await this.presenceService.bumpPresenceVersion(userId);
-        this.server.emit('presence:user_offline', {
+        this.server.to(this.presenceWatchRoom()).emit('presence:user_offline', {
           userId,
           socketId: client.id,
           ts: this.nowIso(),
@@ -288,15 +355,41 @@ export class NotificationGateway
   }
 
   private extractUserId(client: Socket): string | null {
-    const token = (client.handshake as any)?.auth?.token;
+    const required = this.configService.get<boolean>('auth.required') ?? true;
+
+    const rawToken = (client.handshake as any)?.auth?.token;
+    const token = extractBearerToken(rawToken);
+
+    // Si auth es requerida, NO confiamos en query params.
+    if (required) {
+      if (!token) return null;
+      const secret = this.configService.get<string>('auth.jwt.secret') || '';
+      const issuer = this.configService.get<string | undefined>('auth.jwt.issuer');
+      const audience = this.configService.get<string | undefined>('auth.jwt.audience');
+      try {
+        const payload = verifyJwtHs256(token, secret, { issuer, audience });
+        return getUserIdFromJwtPayload(payload);
+      } catch {
+        return null;
+      }
+    }
+
+    // Modo dev: permitimos query userId (demo), pero si hay token válido lo preferimos.
     if (token) {
-      // TODO: Validar token y extraer userId
+      const secret = this.configService.get<string>('auth.jwt.secret') || '';
+      if (secret) {
+        try {
+          const payload = verifyJwtHs256(token, secret);
+          const uid = getUserIdFromJwtPayload(payload);
+          if (uid) return uid;
+        } catch {
+          // ignorar en dev
+        }
+      }
     }
 
     const userId = (client.handshake.query as any)?.userId;
-    if (typeof userId === 'string' && userId.trim()) {
-      return userId.trim();
-    }
+    if (typeof userId === 'string' && userId.trim()) return userId.trim();
     return null;
   }
 
@@ -375,7 +468,9 @@ export class NotificationGateway
     await client.join(this.chatRoom(chatId));
     try {
       await this.presenceService.chatJoin({ socketId: client.id, chatId });
-    } catch { }
+    } catch (e: any) {
+      this.logger.warn(`chatJoin failed socket=${client.id} chat=${chatId}: ${e?.message || e}`);
+    }
     const fromUserId = this.socketUsers.get(client.id);
     if (fromUserId) {
       this.server.to(this.presenceWatchRoom()).emit('presence:chat_joined', {
@@ -398,7 +493,9 @@ export class NotificationGateway
     await client.leave(this.chatRoom(chatId));
     try {
       await this.presenceService.chatLeave({ socketId: client.id, chatId });
-    } catch { }
+    } catch (e: any) {
+      this.logger.warn(`chatLeave failed socket=${client.id} chat=${chatId}: ${e?.message || e}`);
+    }
     const fromUserId = this.socketUsers.get(client.id);
     if (fromUserId) {
       this.server.to(this.presenceWatchRoom()).emit('presence:chat_left', {
@@ -421,6 +518,11 @@ export class NotificationGateway
    */
   @SubscribeMessage('presence:subscribe')
   async presenceSubscribe(@ConnectedSocket() client: Socket) {
+    const required = this.configService.get<boolean>('auth.required') ?? true;
+    if (required) {
+      const userId = this.socketUsers.get(client.id);
+      if (!userId || !this.isAdminUser(userId)) return { ok: false, error: 'forbidden' };
+    }
     await client.join(this.presenceWatchRoom());
     return { ok: true };
   }
@@ -440,6 +542,13 @@ export class NotificationGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { chatId: string; text?: string; data?: any; clientMessageId?: string },
   ) {
+    if (!this.consumeRateLimit(client, 'chat:sendMessage')) {
+      return { ok: false, error: 'rate_limited' };
+    }
+    if (!this.isPayloadWithinLimit(body?.data ?? body?.text ?? '')) {
+      return { ok: false, error: 'payload_too_large' };
+    }
+
     const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
     if (!chatId) return { ok: false, error: 'missing_chatId' };
 
@@ -472,12 +581,27 @@ export class NotificationGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { sectionId?: string; event: string; data: any },
   ) {
+    if (!this.consumeRateLimit(client, 'section:emit')) {
+      return { ok: false, error: 'rate_limited' };
+    }
     const event = body?.event?.trim?.() ? body.event.trim() : '';
     if (!event) return { ok: false, error: 'missing_event' };
+    if (!this.validateClientEmitEventName(event)) return { ok: false, error: 'invalid_event' };
+    if (!this.isPayloadWithinLimit(body?.data)) return { ok: false, error: 'payload_too_large' };
 
-    const sectionId =
-      (body?.sectionId?.trim?.() ? body.sectionId.trim() : '') ||
-      (this.socketSection.get(client.id) || '');
+    const currentSectionId = this.socketSection.get(client.id) || '';
+    const requestedSectionId = body?.sectionId?.trim?.() ? body.sectionId.trim() : '';
+    const fromUserId = this.getUserIdOrThrow(client);
+
+    // Por defecto: solo emitir a la sección actual del socket.
+    // Solo admins pueden emitir a una sección distinta explícitamente.
+    const sectionId = requestedSectionId
+      ? requestedSectionId === currentSectionId
+        ? requestedSectionId
+        : this.isAdminUser(fromUserId)
+          ? requestedSectionId
+          : currentSectionId
+      : currentSectionId;
 
     if (!sectionId) return { ok: false, error: 'missing_sectionId' };
 
@@ -485,7 +609,6 @@ export class NotificationGateway
     const inRoom = await this.isSocketInRoom(client, room);
     if (!inRoom) return { ok: false, error: 'not_in_section_room' };
 
-    const fromUserId = this.getUserIdOrThrow(client);
     const payload = {
       messageId: this.makeMessageId(),
       fromUserId,
@@ -507,10 +630,16 @@ export class NotificationGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { event: string; data: any },
   ) {
+    if (!this.consumeRateLimit(client, 'broadcast:emit')) {
+      return { ok: false, error: 'rate_limited' };
+    }
     const event = body?.event?.trim?.() ? body.event.trim() : '';
     if (!event) return { ok: false, error: 'missing_event' };
+    if (!this.validateClientEmitEventName(event)) return { ok: false, error: 'invalid_event' };
+    if (!this.isPayloadWithinLimit(body?.data)) return { ok: false, error: 'payload_too_large' };
 
     const fromUserId = this.getUserIdOrThrow(client);
+    if (!this.isAdminUser(fromUserId)) return { ok: false, error: 'forbidden' };
     const payload = {
       messageId: this.makeMessageId(),
       fromUserId,
@@ -533,6 +662,12 @@ export class NotificationGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() body: { toUserId: string; event?: string; data: any; clientMessageId?: string },
   ) {
+    if (!this.consumeRateLimit(client, 'dm:send')) {
+      return { ok: false, error: 'rate_limited' };
+    }
+    if (!this.isPayloadWithinLimit(body?.data)) {
+      return { ok: false, error: 'payload_too_large' };
+    }
     const toUserId = body?.toUserId?.trim?.() ? body.toUserId.trim() : '';
     if (!toUserId) return { ok: false, error: 'missing_toUserId' };
 

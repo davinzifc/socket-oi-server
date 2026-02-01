@@ -9,6 +9,7 @@ import { Logger } from '@nestjs/common';
 import type { Job } from 'bull';
 import { NotificationGateway } from './notification.gateway';
 import type { NotificationJob } from './notification.service';
+import { chunkArray } from '../../common/utils/array';
 
 const CONCURRENCY_SINGLE = parseInt(process.env.PROCESSOR_CONCURRENCY_SINGLE || '10', 10);
 const CONCURRENCY_BATCH = parseInt(process.env.PROCESSOR_CONCURRENCY_BATCH || '5', 10);
@@ -123,7 +124,7 @@ export class NotificationProcessor {
       return;
     }
 
-    const subBatches = this.chunkArray(userIds, SUB_BATCH_SIZE);
+    const subBatches = chunkArray(userIds, SUB_BATCH_SIZE);
 
     for (let i = 0; i < subBatches.length; i++) {
       const batch = subBatches[i];
@@ -170,14 +171,6 @@ export class NotificationProcessor {
   @OnQueueFailed()
   onFailed(job: Job, error: Error): void {
     this.logger.error(`Job ${job.id} failed after ${job.attemptsMade} attempts: ${error.message}`);
-  }
-
-  private chunkArray<T>(array: T[], size: number): T[][] {
-    const chunks: T[][] = [];
-    for (let i = 0; i < array.length; i += size) {
-      chunks.push(array.slice(i, i + size));
-    }
-    return chunks;
   }
 
   private delay(ms: number): Promise<void> {

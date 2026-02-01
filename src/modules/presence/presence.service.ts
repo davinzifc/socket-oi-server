@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../../common/redis/redis.service';
 
 export interface PresenceState {
@@ -17,10 +18,16 @@ export class PresenceService {
   private readonly logger = new Logger(PresenceService.name);
 
   // TTL “de seguridad” para limpiar estado si el proceso muere sin disconnect
-  private readonly SOCKET_TTL_SECONDS = parseInt(process.env.PRESENCE_SOCKET_TTL_SECONDS || '600', 10);
-  private readonly IDLE_AFTER_SECONDS = parseInt(process.env.PRESENCE_IDLE_AFTER_SECONDS || '60', 10);
+  private readonly SOCKET_TTL_SECONDS: number;
+  private readonly IDLE_AFTER_SECONDS: number;
 
-  constructor(private readonly redisService: RedisService) { }
+  constructor(
+    private readonly redisService: RedisService,
+    private readonly configService: ConfigService,
+  ) {
+    this.SOCKET_TTL_SECONDS = this.configService.get<number>('presence.socketTtlSeconds') ?? 600;
+    this.IDLE_AFTER_SECONDS = this.configService.get<number>('presence.idleAfterSeconds') ?? 60;
+  }
 
   private socketKey(socketId: string) {
     return `presence:socket:${socketId}`;
@@ -79,8 +86,8 @@ export class PresenceService {
   }
 
   private offlineAfterSeconds(): number {
-    const n = parseInt(process.env.PRESENCE_OFFLINE_AFTER_SECONDS || '', 10);
-    return Number.isFinite(n) && n > 0 ? n : this.SOCKET_TTL_SECONDS;
+    const n = this.configService.get<number | undefined>('presence.offlineAfterSeconds');
+    return Number.isFinite(n as number) && (n as number) > 0 ? (n as number) : this.SOCKET_TTL_SECONDS;
   }
 
   private nowMs(): number {
@@ -89,7 +96,7 @@ export class PresenceService {
 
   async tryAcquireSweeperLock(): Promise<boolean> {
     const redis = this.redisService.getClient();
-    const ttlMs = parseInt(process.env.PRESENCE_SWEEP_LOCK_TTL_MS || '15000', 10);
+    const ttlMs = this.configService.get<number>('presence.sweepLockTtlMs') ?? 15000;
     if (ttlMs <= 0) return true; // lock deshabilitado
 
     const token = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -125,6 +132,61 @@ export class PresenceService {
     if (!score) return 'IDLE';
     const ageSeconds = (this.nowMs() - parseInt(score, 10)) / 1000;
     return ageSeconds >= this.IDLE_AFTER_SECONDS ? 'IDLE' : 'ONLINE';
+  }
+
+  async getOnlineCount(): Promise<number> {
+    const redis = this.redisService.getClient();
+    return await redis.scard(this.onlineUsersKey());
+  }
+
+  async getActiveSectionsCount(): Promise<number> {
+    const redis = this.redisService.getClient();
+    return await redis.scard(this.activeSectionsKey());
+  }
+
+  async getActiveChatsCount(): Promise<number> {
+    const redis = this.redisService.getClient();
+    return await redis.scard(this.activeChatsKey());
+  }
+
+  async getUsersPresenceDetails(
+    userIds: string[],
+  ): Promise<Array<{ userId: string; status: PresenceStatus; lastSeenAt: string | null; presenceVersion: number }>> {
+    if (!userIds.length) return [];
+    const redis = this.redisService.getClient();
+    const p = redis.pipeline();
+    for (const u of userIds) {
+      p.zscore(this.lastSeenZsetKey(), u);
+      p.get(this.userLastSeenKey(u));
+      p.get(this.presenceVersionKey(u));
+    }
+    const res = await p.exec();
+
+    const out: Array<{
+      userId: string;
+      status: PresenceStatus;
+      lastSeenAt: string | null;
+      presenceVersion: number;
+    }> = [];
+
+    for (let i = 0; i < userIds.length; i++) {
+      const base = i * 3;
+      const scoreRaw = res?.[base]?.[1] as string | null;
+      const lastSeenAt = (res?.[base + 1]?.[1] as string | null) ?? null;
+      const pvRaw = res?.[base + 2]?.[1] as string | null;
+      const presenceVersion = parseInt(pvRaw || '0', 10) || 0;
+
+      // Si está en el set online, es ONLINE/IDLE; OFFLINE se resuelve antes de llamar a este método.
+      if (!scoreRaw) {
+        out.push({ userId: userIds[i], status: 'IDLE', lastSeenAt, presenceVersion });
+        continue;
+      }
+      const ageSeconds = (this.nowMs() - parseInt(scoreRaw, 10)) / 1000;
+      const status: PresenceStatus = ageSeconds >= this.IDLE_AFTER_SECONDS ? 'IDLE' : 'ONLINE';
+      out.push({ userId: userIds[i], status, lastSeenAt, presenceVersion });
+    }
+
+    return out;
   }
 
   /**
@@ -549,11 +611,6 @@ export class PresenceService {
     return online.slice(0, limit);
   }
 
-  async getOnlineCount(): Promise<number> {
-    const online = await this.getOnlineUsers(100000);
-    return online.length;
-  }
-
   async getSectionUsers(sectionId: string, limit: number = 500): Promise<string[]> {
     const redis = this.redisService.getClient();
     const users = await redis.smembers(this.sectionUsersKey(sectionId));
@@ -634,11 +691,15 @@ export class PresenceService {
     const userId = await redis.hget(sk, 'userId');
     if (!userId) throw new Error('socket_not_registered');
 
-    await redis.set(this.userLastSeenKey(userId), new Date().toISOString(), 'EX', this.SOCKET_TTL_SECONDS);
-    await redis.srem(this.socketChatsKey(socketId), chatId);
-    await redis.hincrby(this.chatCountsKey(chatId), userId, -1);
+    const first = redis.pipeline();
+    first.set(this.userLastSeenKey(userId), new Date().toISOString(), 'EX', this.SOCKET_TTL_SECONDS);
+    first.srem(this.socketChatsKey(socketId), chatId);
+    first.hincrby(this.chatCountsKey(chatId), userId, -1);
+    first.hget(this.chatCountsKey(chatId), userId);
+    const r1 = await first.exec();
 
-    const count = await redis.hget(this.chatCountsKey(chatId), userId);
+    // r1[3] = hget result
+    const count = (r1?.[3]?.[1] as string | null) ?? null;
     const n = parseInt(count || '0', 10);
     if (n <= 0) {
       await redis
@@ -649,9 +710,7 @@ export class PresenceService {
     }
 
     const remainingInChat = await redis.scard(this.chatUsersKey(chatId));
-    if (remainingInChat <= 0) {
-      await redis.srem(this.activeChatsKey(), chatId);
-    }
+    if (remainingInChat <= 0) await redis.srem(this.activeChatsKey(), chatId);
   }
 
   async getChatUsers(chatId: string, limit: number = 500): Promise<string[]> {

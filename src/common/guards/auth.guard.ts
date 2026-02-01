@@ -5,6 +5,11 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import {
+  extractBearerToken,
+  getUserIdFromJwtPayload,
+  verifyJwtHs256,
+} from '../auth/jwt';
 
 /**
  * Guard mínimo para la especificación.
@@ -20,11 +25,25 @@ export class AuthGuard implements CanActivate {
     if (!required) return true;
 
     const request = context.switchToHttp().getRequest();
-    const token = request?.headers?.authorization;
+    const rawAuth = request?.headers?.authorization;
+    const token = extractBearerToken(rawAuth);
     if (!token) {
       throw new UnauthorizedException('Missing Authorization header');
     }
-    return true;
+
+    const secret = this.configService.get<string>('auth.jwt.secret') || '';
+    const issuer = this.configService.get<string | undefined>('auth.jwt.issuer');
+    const audience = this.configService.get<string | undefined>('auth.jwt.audience');
+    try {
+      const payload = verifyJwtHs256(token, secret, { issuer, audience });
+      const userId = getUserIdFromJwtPayload(payload);
+      if (!userId) throw new Error('missing_userId_claim');
+      // Convención típica de Nest: request.user
+      request.user = { userId, claims: payload };
+      return true;
+    } catch (e: any) {
+      throw new UnauthorizedException(e?.message || 'Invalid token');
+    }
   }
 }
 
