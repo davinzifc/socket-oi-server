@@ -91,6 +91,15 @@ curl -X POST "http://localhost:3000/notifications/send" \
 
 > Importante: los eventos de presencia (`presence:user_online/offline`, etc.) ahora se envían **solo** a sockets que llamen `presence:subscribe` (y en producción, solo admins).
 
+Además, para UIs normales (no admin), existen eventos **room-scoped** para actualizar miembros en tiempo real:
+
+- **Sección (`section:{sectionId}`)**:
+  - `presence:section_user_joined`
+  - `presence:section_user_left`
+- **Chat (`chat:{chatId}`)**:
+  - `presence:chat_user_joined`
+  - `presence:chat_user_left`
+
 Ejemplo (pseudo):
 
 ```js

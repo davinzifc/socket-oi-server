@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Hash, Users } from 'lucide-react';
 import { useSocket } from '../../hooks/useSocket';
 
@@ -13,7 +14,24 @@ interface ChatRoomListProps {
 }
 
 export function ChatRoomList({ selectedRoom, onSelectRoom }: ChatRoomListProps) {
-  const { chatUserCounts } = useSocket();
+  const { chatUserCounts, fetchChatUsers } = useSocket();
+
+  // Obtener conteos iniciales y refrescar periódicamente
+  useEffect(() => {
+    // Fetch inicial
+    AVAILABLE_ROOMS.forEach((room) => {
+      fetchChatUsers(room.id);
+    });
+
+    // Refetch cada 30 segundos para mantener conteos sincronizados
+    const interval = setInterval(() => {
+      AVAILABLE_ROOMS.forEach((room) => {
+        fetchChatUsers(room.id);
+      });
+    }, 30000);
+
+    return () => clearInterval(interval);
+  }, [fetchChatUsers]);
 
   return (
     <div className="bg-gray-50 border-r border-gray-200 w-64 flex flex-col">
@@ -38,9 +56,13 @@ export function ChatRoomList({ selectedRoom, onSelectRoom }: ChatRoomListProps) 
               <div className="font-medium">{room.name}</div>
               <div className="text-xs text-gray-500">{room.description}</div>
             </div>
-            <div className="flex items-center gap-1 text-xs text-gray-500">
+            <div className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${
+              (chatUserCounts.get(room.id) || 0) > 0
+                ? 'bg-green-100 text-green-700'
+                : 'bg-gray-100 text-gray-500'
+            }`}>
               <Users className="w-3 h-3" />
-              <span>{chatUserCounts.get(room.id) || 0}</span>
+              <span className="font-medium">{chatUserCounts.get(room.id) || 0}</span>
             </div>
           </button>
         ))}

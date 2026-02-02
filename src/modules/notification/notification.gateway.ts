@@ -224,6 +224,15 @@ export class NotificationGateway
       if (sectionId) {
         await client.join(this.sectionRoom(sectionId));
         this.socketSection.set(client.id, sectionId);
+
+        // Notificar a la sección (para que UIs en esa room actualicen miembros)
+        this.server.to(this.sectionRoom(sectionId)).emit('presence:section_user_joined', {
+          userId,
+          socketId: client.id,
+          sectionId,
+          ts: this.nowIso(),
+          reason: 'connect',
+        });
       }
 
       const { becameOnline } = await this.presenceService.onConnect({
@@ -272,10 +281,31 @@ export class NotificationGateway
       const userId = this.socketUsers.get(client.id);
       if (!userId) return;
 
-      this.socketSection.delete(client.id);
       this.unregisterUserSocket(userId, client.id);
-      const { becameOffline } = await this.presenceService.onDisconnect(client.id);
+      const { becameOffline, sectionId, chatIds } = await this.presenceService.onDisconnect(client.id);
       const remainingSockets = this.userSockets.get(userId)?.size || 0;
+
+      // Notificar a rooms específicas (sección y chats) para que clientes en esas rooms actualicen presencia
+      const ts = this.nowIso();
+      if (sectionId) {
+        this.server.to(this.sectionRoom(sectionId)).emit('presence:section_user_left', {
+          userId,
+          socketId: client.id,
+          sectionId,
+          ts,
+          reason: 'disconnect',
+        });
+      }
+      for (const chatId of chatIds || []) {
+        this.server.to(this.chatRoom(chatId)).emit('presence:chat_user_left', {
+          userId,
+          socketId: client.id,
+          chatId,
+          ts,
+          reason: 'disconnect',
+        });
+      }
+      this.socketSection.delete(client.id);
 
       // Evento para UIs suscritas a presencia (solo cuando el usuario ya no tiene sockets)
       if (becameOffline) {
@@ -420,10 +450,34 @@ export class NotificationGateway
     const prev = this.socketSection.get(client.id);
     if (prev && prev !== sectionId) {
       await client.leave(this.sectionRoom(prev));
+
+      // Notificar a la sección anterior que este usuario salió
+      const userId = this.socketUsers.get(client.id);
+      if (userId) {
+        this.server.to(this.sectionRoom(prev)).emit('presence:section_user_left', {
+          userId,
+          socketId: client.id,
+          sectionId: prev,
+          ts: this.nowIso(),
+          reason: 'section_change',
+        });
+      }
     }
 
     await client.join(this.sectionRoom(sectionId));
     this.socketSection.set(client.id, sectionId);
+
+    // Notificar a la nueva sección que este usuario entró
+    const userId = this.socketUsers.get(client.id);
+    if (userId) {
+      this.server.to(this.sectionRoom(sectionId)).emit('presence:section_user_joined', {
+        userId,
+        socketId: client.id,
+        sectionId,
+        ts: this.nowIso(),
+        reason: 'section_change',
+      });
+    }
 
     try {
       const { previousSectionId } = await this.presenceService.setSection({
@@ -465,7 +519,8 @@ export class NotificationGateway
   ) {
     const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
     if (!chatId) return { ok: false, error: 'missing_chatId' };
-    await client.join(this.chatRoom(chatId));
+    const room = this.chatRoom(chatId);
+    await client.join(room);
     try {
       await this.presenceService.chatJoin({ socketId: client.id, chatId });
     } catch (e: any) {
@@ -473,6 +528,15 @@ export class NotificationGateway
     }
     const fromUserId = this.socketUsers.get(client.id);
     if (fromUserId) {
+      // Notificar a miembros del chat (sin echo)
+      client.to(room).emit('presence:chat_user_joined', {
+        userId: fromUserId,
+        socketId: client.id,
+        chatId,
+        ts: this.nowIso(),
+        reason: 'chat_join',
+      });
+
       this.server.to(this.presenceWatchRoom()).emit('presence:chat_joined', {
         userId: fromUserId,
         socketId: client.id,
@@ -490,7 +554,8 @@ export class NotificationGateway
   ) {
     const chatId = body?.chatId?.trim?.() ? body.chatId.trim() : '';
     if (!chatId) return { ok: false, error: 'missing_chatId' };
-    await client.leave(this.chatRoom(chatId));
+    const room = this.chatRoom(chatId);
+    await client.leave(room);
     try {
       await this.presenceService.chatLeave({ socketId: client.id, chatId });
     } catch (e: any) {
@@ -498,6 +563,15 @@ export class NotificationGateway
     }
     const fromUserId = this.socketUsers.get(client.id);
     if (fromUserId) {
+      // Notificar a miembros del chat (no-echo; el emisor ya salió de la room)
+      this.server.to(room).emit('presence:chat_user_left', {
+        userId: fromUserId,
+        socketId: client.id,
+        chatId,
+        ts: this.nowIso(),
+        reason: 'chat_leave',
+      });
+
       this.server.to(this.presenceWatchRoom()).emit('presence:chat_left', {
         userId: fromUserId,
         socketId: client.id,

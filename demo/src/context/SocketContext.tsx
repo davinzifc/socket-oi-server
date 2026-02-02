@@ -2,6 +2,13 @@ import React, { createContext, useContext, useEffect, useRef, useState, useCallb
 import { io, Socket } from 'socket.io-client';
 import type { User, ChatMessage, DirectMessage, Notification, PresenceEvent } from '../types';
 import { generateUUID } from '../utils/helpers';
+import { api } from '../services/api';
+
+interface ChatUser {
+  odUserId: string;
+  displayName: string;
+  joinedAt: string;
+}
 
 interface SocketContextType {
   socket: Socket | null;
@@ -14,6 +21,7 @@ interface SocketContextType {
   notifications: Notification[];
   currentChatId: string | null;
   chatUserCounts: Map<string, number>;
+  chatUsers: Map<string, ChatUser[]>; // Lista de usuarios por chat
   getDisplayName: (userId: string) => string;
   connect: (displayName: string, userId?: string) => void;
   disconnect: () => void;
@@ -24,6 +32,7 @@ interface SocketContextType {
   setSection: (section: string) => void;
   subscribeToPresence: (userIds: string[]) => void;
   clearNotifications: () => void;
+  fetchChatUsers: (chatId: string) => Promise<void>;
 }
 
 const SocketContext = createContext<SocketContextType | null>(null);
@@ -34,6 +43,7 @@ const HEARTBEAT_INTERVAL = 20000;
 export function SocketProvider({ children }: { children: React.ReactNode }) {
   const socketRef = useRef<Socket | null>(null);
   const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
+  const currentUserRef = useRef<{ userId: string; displayName: string } | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [currentUser, setCurrentUser] = useState<{ userId: string; displayName: string } | null>(null);
   const [onlineUsers, setOnlineUsers] = useState<Map<string, User>>(new Map());
@@ -43,6 +53,12 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const [chatUserCounts, setChatUserCounts] = useState<Map<string, number>>(new Map());
+  const [chatUsers, setChatUsers] = useState<Map<string, ChatUser[]>>(new Map());
+
+  // Mantener referencia sincronizada para usar en callbacks
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
   // Get display name for a user (from registry or fallback to userId)
   const getDisplayName = useCallback((userId: string) => {
@@ -145,21 +161,57 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       console.log('User socket disconnected:', data.userId);
     });
 
-    socket.on('presence:chat_joined', (data: { userId: string; chatId: string; displayName?: string }) => {
+    // Eventos de presencia por chat (room-scoped) - estos los reciben todos los clientes en el chat
+    socket.on('presence:chat_user_joined', (data: { userId: string; socketId: string; chatId: string; ts: string; reason: string; displayName?: string }) => {
+      console.log('Chat user joined:', data);
       setChatUserCounts((prev) => {
         const next = new Map(prev);
         next.set(data.chatId, (prev.get(data.chatId) || 0) + 1);
         return next;
       });
+      // Agregar usuario a la lista
+      setChatUsers((prev) => {
+        const next = new Map(prev);
+        const users = next.get(data.chatId) || [];
+        // Evitar duplicados
+        if (!users.find(u => u.odUserId === data.userId)) {
+          next.set(data.chatId, [...users, {
+            odUserId: data.userId,
+            displayName: data.displayName || data.userId,
+            joinedAt: data.ts,
+          }]);
+        }
+        return next;
+      });
     });
 
-    socket.on('presence:chat_left', (data: { userId: string; chatId: string }) => {
+    socket.on('presence:chat_user_left', (data: { userId: string; socketId: string; chatId: string; ts: string; reason: string }) => {
+      console.log('Chat user left:', data);
       setChatUserCounts((prev) => {
         const next = new Map(prev);
         const current = prev.get(data.chatId) || 0;
         next.set(data.chatId, Math.max(0, current - 1));
         return next;
       });
+      // Remover usuario de la lista
+      setChatUsers((prev) => {
+        const next = new Map(prev);
+        const users = next.get(data.chatId) || [];
+        next.set(data.chatId, users.filter(u => u.odUserId !== data.userId));
+        return next;
+      });
+    });
+
+    // Eventos para watchers/admins - solo logging, NO actualizar conteos
+    // (los conteos se actualizan via presence:chat_user_joined/left que son room-scoped)
+    socket.on('presence:chat_joined', (data: { userId: string; chatId: string; displayName?: string }) => {
+      console.log('Watcher: Chat joined:', data);
+      // NO incrementar conteo aquí - ya se hace en presence:chat_user_joined
+    });
+
+    socket.on('presence:chat_left', (data: { userId: string; chatId: string }) => {
+      console.log('Watcher: Chat left:', data);
+      // NO decrementar conteo aquí - ya se hace en presence:chat_user_left
     });
 
     // Chat messages
@@ -255,21 +307,84 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     setNotifications([]);
     setCurrentChatId(null);
     setChatUserCounts(new Map());
+    setChatUsers(new Map());
   }, [stopHeartbeat]);
 
   const joinChat = useCallback((chatId: string) => {
     if (socketRef.current) {
-      if (currentChatId) {
+      // Si estaba en otro chat, salir primero
+      if (currentChatId && currentChatId !== chatId) {
         socketRef.current.emit('chat:leave', { chatId: currentChatId });
+        // Decrementar conteo local del chat anterior (no recibimos el evento de nuestra propia salida)
+        setChatUserCounts((prev) => {
+          const next = new Map(prev);
+          const current = prev.get(currentChatId) || 0;
+          next.set(currentChatId, Math.max(0, current - 1));
+          return next;
+        });
+        // Remover nuestro usuario de la lista del chat anterior
+        const myUserId = currentUserRef.current?.userId;
+        if (myUserId) {
+          setChatUsers((prev) => {
+            const next = new Map(prev);
+            const users = next.get(currentChatId) || [];
+            next.set(currentChatId, users.filter(u => u.odUserId !== myUserId));
+            return next;
+          });
+        }
       }
+
+      // Unirse al nuevo chat
       socketRef.current.emit('chat:join', { chatId });
       setCurrentChatId(chatId);
+
+      // Incrementar conteo local del nuevo chat (no recibimos el evento de nuestro propio join)
+      setChatUserCounts((prev) => {
+        const next = new Map(prev);
+        next.set(chatId, (prev.get(chatId) || 0) + 1);
+        return next;
+      });
+      // Agregar nuestro usuario a la lista del nuevo chat
+      const myUserId = currentUserRef.current?.userId;
+      const myDisplayName = currentUserRef.current?.displayName;
+      if (myUserId) {
+        setChatUsers((prev) => {
+          const next = new Map(prev);
+          const users = next.get(chatId) || [];
+          // Evitar duplicados
+          if (!users.find(u => u.odUserId === myUserId)) {
+            next.set(chatId, [...users, {
+              odUserId: myUserId,
+              displayName: myDisplayName || myUserId,
+              joinedAt: new Date().toISOString(),
+            }]);
+          }
+          return next;
+        });
+      }
     }
   }, [currentChatId]);
 
   const leaveChat = useCallback((chatId: string) => {
     if (socketRef.current) {
       socketRef.current.emit('chat:leave', { chatId });
+      // Decrementar conteo local (no recibimos el evento de nuestra propia salida)
+      setChatUserCounts((prev) => {
+        const next = new Map(prev);
+        const current = prev.get(chatId) || 0;
+        next.set(chatId, Math.max(0, current - 1));
+        return next;
+      });
+      // Remover nuestro usuario de la lista
+      const myUserId = currentUserRef.current?.userId;
+      if (myUserId) {
+        setChatUsers((prev) => {
+          const next = new Map(prev);
+          const users = next.get(chatId) || [];
+          next.set(chatId, users.filter(u => u.odUserId !== myUserId));
+          return next;
+        });
+      }
       if (currentChatId === chatId) {
         setCurrentChatId(null);
       }
@@ -338,6 +453,38 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     setNotifications([]);
   }, []);
 
+  // Obtener usuarios de un chat via API (para inicializar el conteo)
+  const fetchChatUsers = useCallback(async (chatId: string) => {
+    try {
+      const response = await api.getChatUsers(chatId);
+      setChatUserCounts((prev) => {
+        const next = new Map(prev);
+        next.set(chatId, response.count);
+        return next;
+      });
+      // El servidor retorna un array de strings (userIds), convertimos a objetos ChatUser
+      const usersAsObjects: ChatUser[] = (response.users as unknown as (string | ChatUser)[]).map((u) => {
+        if (typeof u === 'string') {
+          // Es un userId string, convertir a objeto
+          return {
+            odUserId: u,
+            displayName: userRegistry.get(u) || u,
+            joinedAt: new Date().toISOString(),
+          };
+        }
+        // Ya es un objeto ChatUser
+        return u;
+      });
+      setChatUsers((prev) => {
+        const next = new Map(prev);
+        next.set(chatId, usersAsObjects);
+        return next;
+      });
+    } catch (error) {
+      console.error('Error fetching chat users:', error);
+    }
+  }, [userRegistry]);
+
   useEffect(() => {
     return () => {
       disconnect();
@@ -357,6 +504,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         notifications,
         currentChatId,
         chatUserCounts,
+        chatUsers,
         getDisplayName,
         connect,
         disconnect,
@@ -367,6 +515,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         setSection,
         subscribeToPresence,
         clearNotifications,
+        fetchChatUsers,
       }}
     >
       {children}

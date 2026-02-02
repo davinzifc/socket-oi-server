@@ -218,6 +218,15 @@ socket.on("system_announcement", (data) =>
 // para evitar fanout global (performance).
 socket.on("presence:user_online", (e) => console.log("user online", e)); // watcher-only
 socket.on("presence:user_offline", (e) => console.log("user offline", e)); // watcher-only
+
+// presencia "en la sala" (room-scoped):
+// Estos SÍ los reciben los clientes dentro de la sección/chat correspondiente.
+socket.on("presence:section_user_joined", (e) =>
+  console.log("section joined", e),
+);
+socket.on("presence:section_user_left", (e) => console.log("section left", e));
+socket.on("presence:chat_user_joined", (e) => console.log("chat joined", e));
+socket.on("presence:chat_user_left", (e) => console.log("chat left", e));
 ```
 
 ### Paso 3 — Presencia por secciones (tracking de “en qué página está”)
@@ -229,6 +238,13 @@ socket.emit("presence:setSection", { sectionId: "chat" }, (ack) => {
   console.log("ack setSection", ack);
 });
 ```
+
+Además, los clientes que estén en `section:{sectionId}` recibirán en tiempo real:
+
+- `presence:section_user_joined`
+- `presence:section_user_left`
+
+Esto sirve para actualizar listas de “usuarios en esta sección” sin hacer polling.
 
 ### Paso 3.1 — Heartbeat (muy recomendado para evitar “usuarios pegados”)
 
@@ -252,6 +268,11 @@ socket.emit("chat:join", { chatId: "room-1" }, (ack) =>
   console.log("join ack", ack),
 );
 ```
+
+Al entrar/salir del chat, los demás miembros del chat reciben:
+
+- `presence:chat_user_joined` (sin echo al emisor)
+- `presence:chat_user_left`
 
 2. Enviar mensaje (no te llega a ti; solo a los demás):
 
@@ -647,6 +668,38 @@ socket.emit("presence:subscribe", {}, (ack) =>
   - `{ userId, socketId, chatId, ts }`
 - `presence:chat_left`
   - `{ userId, socketId, chatId, ts }`
+
+---
+
+## 7.8 Presencia en tiempo real dentro de salas (sin ser watcher/admin)
+
+Esta sección es para UIs normales (no panel admin): permite que **los clientes dentro de una sección/chat**
+se actualicen cuando alguien entra/sale.
+
+### 7.8.1 Eventos por sección (room `section:{sectionId}`)
+
+- `presence:section_user_joined`
+  - `{ userId, socketId, sectionId, ts, reason }`
+- `presence:section_user_left`
+  - `{ userId, socketId, sectionId, ts, reason }`
+
+`reason` típico: `connect`, `section_change`, `disconnect`.
+
+### 7.8.2 Eventos por chat (room `chat:{chatId}`)
+
+- `presence:chat_user_joined`
+  - `{ userId, socketId, chatId, ts, reason }`
+- `presence:chat_user_left`
+  - `{ userId, socketId, chatId, ts, reason }`
+
+`reason` típico: `chat_join`, `chat_leave`, `disconnect`.
+
+### 7.8.3 Cómo mantener el estado en el frontend (recomendado)
+
+- Para inicializar la lista: consulta por REST:
+  - sección: `GET /presence/section/:sectionId`
+  - chat: `GET /presence/chat/:chatId`
+- Luego, aplica los eventos anteriores para ir actualizando el estado local.
 
 ### 7.7.3 Desuscribirse
 

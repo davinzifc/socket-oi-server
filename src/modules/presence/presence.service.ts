@@ -447,7 +447,12 @@ export class PresenceService {
     await pipeline.exec();
   }
 
-  async onDisconnect(socketId: string): Promise<{ becameOffline: boolean; userId?: string }> {
+  async onDisconnect(socketId: string): Promise<{
+    becameOffline: boolean;
+    userId?: string;
+    sectionId?: string;
+    chatIds?: string[];
+  }> {
     const redis = this.redisService.getClient();
     const sk = this.socketKey(socketId);
 
@@ -523,9 +528,9 @@ export class PresenceService {
         .zrem(this.lastSeenZsetKey(), userId)
         .exec();
       const removedFromOnline = ((srem?.[0]?.[1] as number) || 0) === 1;
-      return { becameOffline: removedFromOnline, userId };
+      return { becameOffline: removedFromOnline, userId, sectionId, chatIds };
     }
-    return { becameOffline: false, userId };
+    return { becameOffline: false, userId, sectionId, chatIds };
   }
 
   async setSection(params: { socketId: string; sectionId: string }): Promise<{ previousSectionId?: string }> {
